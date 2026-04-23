@@ -1,5 +1,8 @@
-# Copyright 2025 VLA-Engine. All rights reserved.
+# Copyright 2025 starVLA community. All rights reserved.
 # Licensed under the MIT License, Version 1.0 (the "License"); 
+# Implemented by [Shijie LIAN/ Huazhong University of Science & Technology] in [2026].
+# Design and Merged by [Jinhui YE / HKUST University] in [2026].
+
 
 import torch
 from torch.nn.utils.rnn import pad_sequence
@@ -216,3 +219,6 @@ if __name__ == "__main__":
     cfg.framework.qwenvl.base_vlm = "./data/pretrained_models/Qwen3.5-VL-4B-Instruct"
     qwen_vl = _QWen3_5_VL_Interface(cfg)
     pass
+
+# Compat alias so callers using the WM-side name also work on this VLM interface.
+_QWen3_5_VL_Interface.build_vlm_inputs = _QWen3_5_VL_Interface.build_qwenvl_inputs

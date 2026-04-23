@@ -7,12 +7,13 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Docs](https://img.shields.io/badge/Docs-Online-green.svg)](https://alphabraingroup.github.io/AlphaBrain/)
 [![HuggingFace](https://img.shields.io/badge/%F0%9F%A4%97-Models-orange.svg)](https://huggingface.co/AlphaBrainGroup)
+[![WeChat](https://img.shields.io/badge/WeChat-Group-07C160.svg)](assets/wechat.jpg)
 
 <p align="center">
   <img src="assets/main_fig.png" width="100%" alt="AlphaBrain Architecture Overview"/>
 </p>
 
-**AlphaBrain** is the world’s first all-in-one, open-source community for embodied intelligence, built to be ready out of the box. We unifies multiple VLA architectures, world model backbones, biologically-inspired learning algorithms, and reinforcement learning paradigms under a single, extensible framework. AlphaBrain brings embodied AI within everyone’s reach.
+**AlphaBrain** is an all-in-one, open-source community for embodied intelligence, built to be ready out of the box. We unifies multiple VLA architectures, world model backbones, biologically-inspired learning algorithms, and reinforcement learning paradigms under a single, extensible framework. AlphaBrain brings embodied AI within everyone’s reach.
 
 [Quick Start & Documentation](#-quick-start--documentation) · [Key Features](#-key-features) · [Community](#-community) · [Citation](#-citation)
 
@@ -42,7 +43,7 @@
 </tr>
 <tr>
 <td width="50" align="center">📊</td>
-<td><b>Comprehensive Benchmark Suite</b> — Full adaptation to the latest embodied benchmarks with open-source support for <b>long-horizon task execution and memory</b>: LIBERO, LIBERO-plus, RoboCasa and more to come.</td>
+<td><b>Comprehensive Benchmark Suite</b> — Full adaptation to the latest embodied benchmarks with open-source support for <b>long-horizon task execution and memory</b>: LIBERO, LIBERO-plus, RoboCasa, RoboCasa365 and more to come.</td>
 </tr>
 </table>
 
@@ -129,10 +130,11 @@ We welcome contributions from the community — including new frameworks, benchm
 |:--------|:-----|
 | GitHub Issues | [Report bugs & request features](https://github.com/AlphaBrainGroup/AlphaBrain/issues) |
 | HuggingFace | [Models](https://huggingface.co/AlphaBrainGroup) |
+| WeChat Group | [Scan the QR code to join](assets/wechat.jpg) |
 
 ### Acknowledgments
 
-AlphaBrain stands on the shoulders of an incredible open-source ecosystem. We are deeply grateful to the authors and maintainers of the following projects, whose code, models, datasets, and ideas directly enabled this work:
+AlphaBrain is mainly forked from [starVLA](https://github.com/starVLA/starVLA) and stands on the shoulders of an incredible open-source ecosystem. We are deeply grateful to the authors and maintainers of the following projects, whose code, models, datasets, and ideas directly enabled this work:
 
 - [starVLA/starVLA](https://github.com/starVLA/starVLA)
 - [openvla/openvla](https://github.com/openvla/openvla)
@@ -152,10 +154,10 @@ AlphaBrain stands on the shoulders of an incredible open-source ecosystem. We ar
 ## 📝 Citation
 
 ```bibtex
-@software{AlphaBrain2025,
+@software{AlphaBrain2026,
   title     = {AlphaBrain: a Modular Open-Source Framework for Embodied Intelligence Research},
   author    = {AlphaBrain Community},
-  year      = {2025},
+  year      = {2026},
   url       = {https://github.com/AlphaBrainGroup/AlphaBrain},
   license   = {MIT},
   doi       = {}
@@ -169,5 +171,5 @@ AlphaBrain stands on the shoulders of an incredible open-source ecosystem. We ar
 This project is licensed under the [MIT License](LICENSE).
 
 <div align="center">
-<sub>Built with passion by the AlphaBrain Community</sub>
+<sub>Built with passion by the AlphaBrain Community upon starVLA</sub>
 </div>

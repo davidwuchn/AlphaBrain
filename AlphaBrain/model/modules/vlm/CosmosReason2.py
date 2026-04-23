@@ -1,5 +1,7 @@
-# Copyright 2025 VLA-Engine. All rights reserved.
+# Copyright 2025 starVLA community. All rights reserved.
 # Licensed under the MIT License, Version 1.0 (the "License"); 
+# Implemented by [Haron Wan / CUHK Shenzhen] in [2026].
+
 
 import torch
 import transformers
@@ -136,3 +138,6 @@ if __name__ == "__main__":
     print(SEPARATOR)
     
     # print(f"last_hidden: {last_hidden}")
+
+# Compat alias so callers using the WM-side name also work on this VLM interface.
+_CosmosReason2_Interface.build_vlm_inputs = _CosmosReason2_Interface.build_qwenvl_inputs
