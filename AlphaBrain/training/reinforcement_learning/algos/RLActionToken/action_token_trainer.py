@@ -70,6 +70,7 @@ class BatchInferenceServer:
         max_batch_size: int = 64,
         batch_timeout_s: float = 0.005,
         actor_chunk_len: int = None,
+        encoder_mode: str = "action_token",
     ):
         self.frozen_vla = frozen_vla
         self.encoder = encoder
@@ -80,6 +81,12 @@ class BatchInferenceServer:
         self.batch_timeout_s = batch_timeout_s
         # If actor uses shorter chunk than VLA, slice vla_actions accordingly
         self.actor_chunk_len = actor_chunk_len
+        # Encoder input mode:
+        #   "action_token": feed encoder the chunk_len action-query slice (default).
+        #   "rlt_ori":      feed encoder the full last_hidden image-token slice
+        #                   (z_{1:M} from the RL Token reference, Eq. 1).
+        #   Both produce a rl_token of shape (B, 1, encoder.hidden_dim).
+        self.encoder_mode = encoder_mode
 
         self._q: queue.Queue = queue.Queue()
         self._stop = threading.Event()
@@ -140,12 +147,33 @@ class BatchInferenceServer:
             batch_props  = [r[2] for r in reqs]   # prop_state per request (or None)
 
             with torch.no_grad():
-                with torch.autocast("cuda", dtype=torch.bfloat16):
-                    action_queries, vla_actions = self.frozen_vla.get_vla_action(
-                        batch_images=batch_images,
-                        instructions=batch_instrs,
+                if self.encoder_mode == "rlt_ori":
+                    # Reference-track path: one VLM forward gives full hidden +
+                    # action_queries + vla_actions; compact the image-token
+                    # slice into z_{1:M} and feed RLT_ori encoder.
+                    from AlphaBrain.training.reinforcement_learning.algos.RLT_ori import (
+                        get_vla_hidden_states_and_action,
+                        compact_by_mask,
+                        pad_mask_from_attention,
                     )
-                rl_tokens = self.encoder.encode(action_queries)                   # (B, 1, D)
+                    last_hidden, encoder_mask, _action_mask, action_queries, vla_actions = \
+                        get_vla_hidden_states_and_action(
+                            self.frozen_vla,
+                            batch_images=batch_images,
+                            instructions=batch_instrs,
+                            image_only=True,
+                        )
+                    dense, kp_mask = compact_by_mask(last_hidden, encoder_mask)
+                    rl_tokens = self.encoder.encode(
+                        dense.float(), key_padding_mask=kp_mask
+                    )                                                              # (B, 1, H)
+                else:
+                    with torch.autocast("cuda", dtype=torch.bfloat16):
+                        action_queries, vla_actions = self.frozen_vla.get_vla_action(
+                            batch_images=batch_images,
+                            instructions=batch_instrs,
+                        )
+                    rl_tokens = self.encoder.encode(action_queries)                # (B, 1, D)
 
                 # Stack proprioceptive states for actor/critic
                 B = rl_tokens.size(0)
@@ -629,7 +657,27 @@ def action_token_collect_group(
             success_count = 0
             for fut in as_completed(futures):
                 g_idx = futures[fut]
-                ep = fut.result()
+                try:
+                    ep = fut.result()
+                except Exception as _ep_err:
+                    # Async mode spawns ~G fresh LIBERO subprocesses per iter;
+                    # robosuite/MuJoCo EGL render-context init occasionally
+                    # native-SEGVs the worker under that spawn pressure (the
+                    # parent then sees "LIBERO worker exited unexpectedly").
+                    # Losing one episode is fine; poisoning the whole batch
+                    # via the rollout-thread's try/except (and the main loop
+                    # via the poison pill) is not. Mark this slot as an empty
+                    # failed episode — push_episodes_to_buffer skips
+                    # finish_step==0 so the buffer stays clean.
+                    print(f"  [rollout][dev={device}] ep g_idx={g_idx} FAILED "
+                          f"({type(_ep_err).__name__}: {_ep_err}); "
+                          f"dropping this episode.", flush=True)
+                    ep = ActionTokenEpisode(
+                        task_id=task_id, state_idx=int(state_ids[g_idx]))
+                    ep.success = False
+                    ep.reward = 0.0
+                    ep.finish_step = 0
+                    ep.env_steps = 0
                 episodes[g_idx] = ep
                 done_count += 1
                 if ep.success:

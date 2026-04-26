@@ -26,6 +26,14 @@ def parse_args():
                         "Each iteration collects episodes from every task.")
 
     # RLActionToken architecture
+    p.add_argument("--encoder_mode", type=str, default="action_token",
+                   choices=["action_token", "rlt_ori"],
+                   help="Which encoder family to use in Phase 2. "
+                        "'action_token' (default): pragmatic RLActionToken "
+                        "encoder that consumes the chunk_len action-query slice. "
+                        "'rlt_ori': reference RL Token encoder that consumes the "
+                        "full VLM image-token sequence and keeps z_rl at the VLA "
+                        "hidden dim — pair with --bottleneck_dim 2048.")
     p.add_argument("--bottleneck_dim", type=int, default=256)
     p.add_argument("--encoder_layers", type=int, default=2)
     p.add_argument("--encoder_heads", type=int, default=4)

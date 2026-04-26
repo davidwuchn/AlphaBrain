@@ -132,3 +132,130 @@ def pad_mask_from_attention(attention_mask: torch.Tensor) -> torch.Tensor:
     (True = ignore).
     """
     return attention_mask == 0
+
+
+def compact_by_mask(
+    last_hidden: torch.Tensor,   # (B, L, H)
+    attention_mask: torch.Tensor,  # (B, L) int 0/1
+):
+    """Gather kept positions per sample into a dense ``(B, M_max, H)`` tensor.
+
+    Given the VLA's raw ``(B, L, H)`` last-layer output mixed with image,
+    language, action-placeholder and padding tokens, and an attention mask
+    marking the positions that should feed the RL Token encoder, this
+    packs only the kept rows per sample, left-aligned, and returns a
+    transformer-ready ``key_padding_mask`` for the pad slots.
+
+    This turns HF-shaped VLA output into the reference's ``z_{1:M}``
+    matrix exactly as described in Sec. IV-A.
+
+    (An identical helper lives locally in
+    ``trainers/train_rlt_ori_pretrain.py`` — Phase-1 keeps its private
+    copy to avoid any retroactive change to that working path.)
+    """
+    B, L, H = last_hidden.shape
+    mask = attention_mask.bool()
+    counts = mask.sum(dim=1)
+    M_max = int(counts.max().item()) if counts.numel() > 0 else 0
+    if M_max == 0:
+        return (
+            torch.zeros(B, 1, H, device=last_hidden.device, dtype=last_hidden.dtype),
+            torch.ones(B, 1, device=last_hidden.device, dtype=torch.bool),
+        )
+
+    dense = torch.zeros(B, M_max, H, device=last_hidden.device, dtype=last_hidden.dtype)
+    kp_mask = torch.ones(B, M_max, device=last_hidden.device, dtype=torch.bool)
+    for i in range(B):
+        idx = mask[i].nonzero(as_tuple=False).squeeze(-1)
+        m_i = idx.numel()
+        if m_i == 0:
+            continue
+        dense[i, :m_i] = last_hidden[i].index_select(0, idx)
+        kp_mask[i, :m_i] = False
+    return dense, kp_mask
+
+
+@torch.no_grad()
+def get_vla_hidden_states_and_action(
+    vla,
+    batch_images,
+    instructions,
+    image_only: bool = True,
+    drop_action_tokens: bool = True,
+    image_token_id: int = QWEN_IMAGE_TOKEN_INDEX,
+):
+    """Combined single-forward helper for Phase-2 rollout.
+
+    One VLM forward produces everything the downstream needs:
+
+      * ``last_hidden`` (B, L, H) and its masks — the inputs to the RLT_ori
+        encoder, reshaped via :func:`compact_by_mask` by the caller.
+      * ``action_queries`` (B, chunk_len, H) — gathered at action-placeholder
+        positions, fed into the frozen ``action_model`` to produce the
+        VLA reference action chunk ``ã`` used by the actor.
+      * ``vla_actions`` (B, chunk_len, action_dim) — the reference ``ã`` itself.
+
+    Rationale: in Phase-2 the rollout path needs both ``z_rl`` and ``ã``
+    on every step. Running the VLA forward twice (once for full hidden,
+    once for ``get_vla_action``) doubles the per-step cost unnecessarily;
+    this helper fuses them. Phase-1 pretraining keeps using the simpler
+    :func:`get_vla_hidden_states` because it doesn't need ``ã``.
+    """
+    from deployment.model_server.tools.image_tools import to_pil_preserve
+    from AlphaBrain.training.trainer_utils.trainer_tools import resize_images
+
+    batch_images = [to_pil_preserve(imgs) for imgs in batch_images]
+
+    train_obs_image_size = getattr(vla.config.datasets.vla_data, "image_size", None)
+    if train_obs_image_size:
+        batch_images = resize_images(batch_images, target_size=train_obs_image_size)
+
+    action_tokens = vla.action_token * vla.chunk_len
+    prompt_suffix = (
+        f" Please predict the next {vla.chunk_len} robot actions:"
+        f" <action>{action_tokens}<action>."
+    )
+    instructions = [inst + prompt_suffix for inst in instructions]
+
+    qwen_inputs = vla.qwen_vl_interface.build_qwenvl_inputs(
+        images=batch_images, instructions=instructions
+    )
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        qwen_outputs = vla.qwen_vl_interface(
+            **qwen_inputs,
+            output_attentions=False,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        last_hidden = qwen_outputs.hidden_states[-1]  # (B, L, H)
+
+    input_ids = qwen_inputs.get("input_ids")
+    attention_mask = qwen_inputs.get("attention_mask")
+    if attention_mask is None:
+        attention_mask = torch.ones_like(input_ids)
+
+    action_mask = input_ids == vla.action_token_id  # (B, L) bool
+
+    # ── Action queries / VLA reference action — reuse the framework's own
+    #    gather logic so we follow the exact same selection rule
+    #    (take the last ``chunk_len`` action-token positions per sample).
+    #    Calls into a non-public method on purpose: this keeps us behavior-
+    #    identical to ``get_action_queries`` without a second VLM forward.
+    with torch.autocast("cuda", dtype=torch.float32):
+        action_queries = vla._gather_action_token_embeddings(
+            last_hidden, input_ids, action_token_id=vla.action_token_id
+        )  # (B, chunk_len, H)
+        vla_actions = vla.action_model.predict_action(action_queries)
+
+    # ── Mask for the encoder ``z_{1:M}`` slice
+    if image_only:
+        image_mask = input_ids == image_token_id
+        keep = attention_mask.bool() & image_mask
+        encoder_mask = keep.to(attention_mask.dtype)
+    elif drop_action_tokens:
+        keep = attention_mask.bool() & (~action_mask)
+        encoder_mask = keep.to(attention_mask.dtype)
+    else:
+        encoder_mask = attention_mask
+
+    return last_hidden, encoder_mask, action_mask, action_queries, vla_actions

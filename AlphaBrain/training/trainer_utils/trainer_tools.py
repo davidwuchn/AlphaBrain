@@ -290,22 +290,123 @@ class TrainerUtils:
                     print(f"{_bold_red('[error]')} module path not found: {_yellow(repr(path))}")
         else:  # full load
             try:
-                # Filter out shape-mismatched keys (e.g. action_dim 32→7)
+                # Auto-detect openpi-format pi05/pi0 ckpt and remap keys to this
+                # codebase's nested layout. openpi flat layout (4 prefixes) vs
+                # this codebase's nested PaliGemmaPi05 model.state_dict():
+                #   openpi paligemma_with_expert.paligemma.model.X      → vlm_interface.model.X
+                #   openpi paligemma_with_expert.paligemma.lm_head.X    → vlm_interface.model.lm_head.X
+                #   openpi paligemma_with_expert.gemma_expert.X         → flow_matching_head.action_expert.model.X
+                #   openpi {action_in_proj,action_out_proj,time_mlp_in,time_mlp_out}.X
+                #                                                      → flow_matching_head.<same>.X
+                # Without this, load_state_dict(strict=False) silently drops all 812
+                # openpi keys (0 overlap with model.state_dict()) and the model
+                # trains from random init.
+                if any(k.startswith("paligemma_with_expert.") for k in checkpoint.keys()):
+                    if not dist.is_initialized() or dist.get_rank() == 0:
+                        print(f"{_cyan('[ckpt]')} detected openpi-format pi05 ckpt, remapping {len(checkpoint)} keys → codebase layout")
+                    remap_rules = [
+                        # Order matters: longest prefix first.
+                        # multi_modal_projector has an extra `.linear.` middle level in openpi
+                        # that this codebase's HF PaliGemma doesn't have — strip it.
+                        ("paligemma_with_expert.paligemma.model.multi_modal_projector.linear.",
+                                                                    "vlm_interface.model.multi_modal_projector."),
+                        ("paligemma_with_expert.paligemma.model.",  "vlm_interface.model."),
+                        ("paligemma_with_expert.paligemma.lm_head.", "vlm_interface.model.lm_head."),
+                        ("paligemma_with_expert.gemma_expert.",      "flow_matching_head.action_expert.model."),
+                        ("action_in_proj.",   "flow_matching_head.action_in_proj."),
+                        ("action_out_proj.",  "flow_matching_head.action_out_proj."),
+                        ("time_mlp_in.",      "flow_matching_head.time_mlp_in."),
+                        ("time_mlp_out.",     "flow_matching_head.time_mlp_out."),
+                    ]
+                    remapped = {}
+                    unmapped = []
+                    for k, v in checkpoint.items():
+                        new_k = None
+                        for old_prefix, new_prefix in remap_rules:
+                            if k.startswith(old_prefix):
+                                new_k = new_prefix + k[len(old_prefix):]
+                                break
+                        if new_k is None:
+                            unmapped.append(k)
+                        else:
+                            remapped[new_k] = v
+                    checkpoint = remapped
+                    if unmapped and (not dist.is_initialized() or dist.get_rank() == 0):
+                        print(f"{_bold_yellow('[warn]')} {len(unmapped)} openpi keys with no remap rule (dropped):")
+                        for k in unmapped[:10]:
+                            print(f"  {_dim(k)}")
+                    # openpi pi05 doesn't store embed_tokens (tied to lm_head). Duplicate
+                    # the loaded lm_head weight to populate the embed_tokens slot(s) so
+                    # they aren't left at random init.
+                    lm_head_w = checkpoint.get("vlm_interface.model.lm_head.weight")
+                    if lm_head_w is not None:
+                        for tied_key in (
+                            "vlm_interface.model.embed_tokens.weight",
+                            "vlm_interface.model.language_model.embed_tokens.weight",
+                        ):
+                            checkpoint.setdefault(tied_key, lm_head_w)
+
+                # Filter out shape-mismatched keys, with smart truncation for
+                # action projection layers. openpi pi05 was pretrained with
+                # action_dim=32 (universal across robots), but this codebase's
+                # config uses the actual robot's action_dim (e.g. 7 for franka).
+                # openpi convention: dim 0..N-1 = actual robot action, dim N..31 = zero pad.
+                # → for action_in/out_proj layers, slice openpi's [..., :model_dim]
+                #   to recover the actual-robot projection. Without this, these
+                #   tiny but critical I/O layers are random-init and need lots of
+                #   training to recover.
                 model_state = model.state_dict()
                 filtered_checkpoint = {}
                 skipped_keys = []
+                truncated_keys = []
+                ACTION_PROJ_KEYS = {
+                    "flow_matching_head.action_in_proj.weight",   # [hidden, action_dim]
+                    "flow_matching_head.action_in_proj.bias",     # [hidden]
+                    "flow_matching_head.action_out_proj.weight",  # [action_dim, hidden]
+                    "flow_matching_head.action_out_proj.bias",    # [action_dim]
+                }
                 for k, v in checkpoint.items():
-                    if k in model_state and model_state[k].shape != v.shape:
-                        skipped_keys.append(f"{k}: ckpt {tuple(v.shape)} vs model {tuple(model_state[k].shape)}")
-                    else:
+                    if k not in model_state:
                         filtered_checkpoint[k] = v
+                        continue
+                    target_shape = tuple(model_state[k].shape)
+                    if tuple(v.shape) == target_shape:
+                        filtered_checkpoint[k] = v
+                    elif k in ACTION_PROJ_KEYS and len(v.shape) == len(target_shape) and all(
+                        ts <= cs for ts, cs in zip(target_shape, v.shape)
+                    ):
+                        # Truncate each axis to model size (openpi pad dims are after real dims)
+                        slices = tuple(slice(0, ts) for ts in target_shape)
+                        v_trunc = v[slices].contiguous()
+                        filtered_checkpoint[k] = v_trunc
+                        truncated_keys.append(f"{k}: ckpt {tuple(v.shape)} → truncated to model {target_shape}")
+                    else:
+                        skipped_keys.append(f"{k}: ckpt {tuple(v.shape)} vs model {target_shape}")
+                if truncated_keys and (not dist.is_initialized() or dist.get_rank() == 0):
+                    print(f"{_cyan('[ckpt]')} truncated {len(truncated_keys)} action projection key(s) (openpi 32-dim → model action_dim):")
+                    for tk in truncated_keys:
+                        print(f"  {_dim(tk)}")
                 if skipped_keys and (not dist.is_initialized() or dist.get_rank() == 0):
                     print(f"{_bold_yellow('[warn]')} skipped {len(skipped_keys)} shape-mismatched keys:")
                     for sk in skipped_keys:
                         print(f"  {_dim(sk)}")
+                # Track what actually loads vs gets random-initialized.
+                # Without this, strict=False silently leaves missing keys at random init
+                # — exactly the bug we just fixed.
+                missing_in_ckpt = sorted(set(model_state.keys()) - set(filtered_checkpoint.keys()))
+                in_ckpt_not_model = sorted(set(filtered_checkpoint.keys()) - set(model_state.keys()))
                 model.load_state_dict(filtered_checkpoint, strict=False)
                 if not dist.is_initialized() or dist.get_rank() == 0:
-                    print(f"{_bold_green('[ok]')} loaded {_bold_cyan('<full_model>')} parameters")
+                    n_loaded = len(set(filtered_checkpoint.keys()) & set(model_state.keys()))
+                    print(f"{_bold_green('[ok]')} loaded {_bold_cyan(f'{n_loaded}/{len(model_state)}')} model params from ckpt "
+                          f"({len(missing_in_ckpt)} model keys randomly initialized, "
+                          f"{len(in_ckpt_not_model)} ckpt keys ignored)")
+                    if missing_in_ckpt:
+                        print(f"{_bold_yellow('[warn]')} {len(missing_in_ckpt)} model keys NOT in ckpt → using random init:")
+                        for k in missing_in_ckpt[:10]:
+                            print(f"  {_dim(k)}")
+                        if len(missing_in_ckpt) > 10:
+                            print(f"  {_dim(f'... and {len(missing_in_ckpt) - 10} more')}")
                 loaded_modules = ["<full_model>"]
             except Exception as e:
                 raise RuntimeError(f"{_bold_red('[error]')} loading full model failed: {e}")

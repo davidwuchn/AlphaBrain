@@ -16,7 +16,9 @@ from AlphaBrain.training.reinforcement_learning.algos.RLT_ori.encoder_decoder im
 )
 from AlphaBrain.training.reinforcement_learning.algos.RLT_ori.vla_features import (
     get_vla_hidden_states,
+    get_vla_hidden_states_and_action,
     pad_mask_from_attention,
+    compact_by_mask,
 )
 
 __all__ = [
@@ -24,5 +26,7 @@ __all__ = [
     "RLTokenDecoder",
     "RLTokenEncoderDecoder",
     "get_vla_hidden_states",
+    "get_vla_hidden_states_and_action",
     "pad_mask_from_attention",
+    "compact_by_mask",
 ]

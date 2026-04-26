@@ -78,6 +78,7 @@ def action_token_collect_group_steplock(
     actor_chunk_len: int = None,
     env_offset: int = 0,
     warmup_mode: bool = False,
+    encoder_mode: str = "action_token",
 ) -> List[ActionTokenEpisode]:
     """
     Collect G episodes using step-lock architecture.
@@ -158,18 +159,34 @@ def action_token_collect_group_steplock(
         batch_props = [np.array(obs_list[g]["state"], dtype=np.float32) for g in active_ids]
 
         print(f"  [VLA forward] batch={len(batch_images)}, active_envs={len(active_ids)}", flush=True)
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            action_queries, vla_actions = frozen_vla.get_vla_action(
-                batch_images=batch_images, instructions=batch_instrs)
+        if encoder_mode == "rlt_ori":
+            # rlt_ori path: one fused VLM forward yields full hidden state +
+            # action_queries + vla_actions; feed compacted image tokens to
+            # the RL Token encoder (mirrors BatchInferenceServer._loop and
+            # eval_helpers_rlt_ori_zhanghe).
+            from AlphaBrain.training.reinforcement_learning.algos.RLT_ori import (
+                get_vla_hidden_states_and_action, compact_by_mask,
+            )
+            last_hidden, encoder_mask, _act_mask, action_queries, vla_actions = \
+                get_vla_hidden_states_and_action(
+                    frozen_vla,
+                    batch_images=batch_images, instructions=batch_instrs,
+                    image_only=True,
+                )
+            dense, kp_mask = compact_by_mask(last_hidden, encoder_mask)
+            rl_tokens = encoder.encode(dense.float(), key_padding_mask=kp_mask)
+        else:
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                action_queries, vla_actions = frozen_vla.get_vla_action(
+                    batch_images=batch_images, instructions=batch_instrs)
+            rl_tokens = encoder.encode(action_queries)  # (N_active, 1, D)
         torch.cuda.synchronize()
         _t1 = time.time()
         _t_vla_forward += _t1 - _t0
-        print(f"  [VLA done] aq={action_queries.shape} va={vla_actions.shape} time={_t1-_t0:.3f}s", flush=True)
+        print(f"  [VLA done] va={vla_actions.shape} time={_t1-_t0:.3f}s", flush=True)
 
-        # ── Step 2: Batch encoder + actor ──
+        # ── Step 2: Batch actor ──
         _t0 = time.time()
-        rl_tokens = encoder.encode(action_queries)  # (N_active, 1, D)
-
         props_t = torch.tensor(np.array(batch_props), dtype=torch.float32).to(device)
 
         # Slice VLA actions for actor if actor uses shorter chunk
@@ -311,6 +328,7 @@ def action_token_collect_multitask_steplock(
     reward_coef: float = 1.0,
     actor_chunk_len: int = None,
     warmup_mode: bool = False,
+    encoder_mode: str = "action_token",
 ) -> List[ActionTokenEpisode]:
     """
     Collect episodes for MULTIPLE tasks on ONE GPU in a single step-lock loop.
@@ -388,11 +406,23 @@ def action_token_collect_multitask_steplock(
         batch_instrs = [task_descriptions[g] for g in active_ids]
         batch_props = [np.array(obs_list[g]["state"], dtype=np.float32) for g in active_ids]
 
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            action_queries, vla_actions = frozen_vla.get_vla_action(
-                batch_images=batch_images, instructions=batch_instrs)
-
-        rl_tokens = encoder.encode(action_queries)
+        if encoder_mode == "rlt_ori":
+            from AlphaBrain.training.reinforcement_learning.algos.RLT_ori import (
+                get_vla_hidden_states_and_action, compact_by_mask,
+            )
+            last_hidden, encoder_mask, _act_mask, action_queries, vla_actions = \
+                get_vla_hidden_states_and_action(
+                    frozen_vla,
+                    batch_images=batch_images, instructions=batch_instrs,
+                    image_only=True,
+                )
+            dense, kp_mask = compact_by_mask(last_hidden, encoder_mask)
+            rl_tokens = encoder.encode(dense.float(), key_padding_mask=kp_mask)
+        else:
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                action_queries, vla_actions = frozen_vla.get_vla_action(
+                    batch_images=batch_images, instructions=batch_instrs)
+            rl_tokens = encoder.encode(action_queries)
         props_t = torch.tensor(np.array(batch_props), dtype=torch.float32).to(device)
 
         if actor_chunk_len < vla_actions.size(1):

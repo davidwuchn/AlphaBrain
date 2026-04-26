@@ -951,9 +951,12 @@ class VLATrainer(TrainerUtils):
 
         log_dict = {
             "action_dit_loss": action_loss.item(),
-            "action_mse": output_dict.get("action_mse", torch.tensor(0.0)).item() if isinstance(output_dict.get("action_mse"), torch.Tensor) else output_dict.get("action_mse", 0.0),
-            "cond_mse": output_dict.get("cond_mse", torch.tensor(0.0)).item() if isinstance(output_dict.get("cond_mse"), torch.Tensor) else output_dict.get("cond_mse", 0.0),
         }
+        for k in ("action_mse", "cond_mse"):
+            v = output_dict.get(k)
+            if v is None:
+                continue
+            log_dict[k] = v.item() if isinstance(v, torch.Tensor) else v
         # V2: log video_loss and total_loss if present
         if "video_loss" in output_dict:
             vl = output_dict["video_loss"]

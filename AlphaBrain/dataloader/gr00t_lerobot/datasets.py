@@ -820,14 +820,26 @@ class LeRobotSingleDataset(Dataset):
         trajectory_lengths: np.ndarray,
         episode_metadata: list[dict],
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Filter trajectories to keep only N per task (for few-shot SFT).
+        """Filter trajectories for few-shot / single-task SFT.
 
-        Enabled via `datasets.vla_data.num_traj_per_task: N` in the mode config.
+        Two orthogonal filters; either or both can be set in mode config:
+          `datasets.vla_data.task_whitelist: [<task-name>, ...]`
+              Keep only episodes whose task string is in this list.
+          `datasets.vla_data.num_traj_per_task: N`
+              After whitelist filtering, keep only the first N episodes per task.
+
         `episode_metadata` items must have `episode_index` and `tasks` keys.
         """
         num_traj_per_task = self.data_cfg.get("num_traj_per_task", None) if self.data_cfg else None
-        if num_traj_per_task is None:
+        task_whitelist = self.data_cfg.get("task_whitelist", None) if self.data_cfg else None
+        if num_traj_per_task is None and not task_whitelist:
             return trajectory_ids, trajectory_lengths
+
+        # Normalize whitelist to a set of strings for fast lookup
+        if task_whitelist is not None:
+            task_whitelist_set = set(task_whitelist)
+        else:
+            task_whitelist_set = None
 
         ep_to_task = {}
         for ep in episode_metadata:
@@ -840,17 +852,28 @@ class LeRobotSingleDataset(Dataset):
         keep_mask = []
         for tid in trajectory_ids:
             task = ep_to_task.get(int(tid), None)
-            if task is not None and task_count[task] < num_traj_per_task:
-                keep_mask.append(True)
-                task_count[task] += 1
-            else:
+            if task is None:
                 keep_mask.append(False)
+                continue
+            if task_whitelist_set is not None and task not in task_whitelist_set:
+                keep_mask.append(False)
+                continue
+            if num_traj_per_task is not None and task_count[task] >= num_traj_per_task:
+                keep_mask.append(False)
+                continue
+            keep_mask.append(True)
+            task_count[task] += 1
 
         keep_mask = np.array(keep_mask)
         filtered_ids = trajectory_ids[keep_mask]
         filtered_lengths = trajectory_lengths[keep_mask]
+        tag = []
+        if task_whitelist_set is not None:
+            tag.append(f"task_whitelist={sorted(task_whitelist_set)}")
+        if num_traj_per_task is not None:
+            tag.append(f"num_traj_per_task={num_traj_per_task}")
         print(
-            f"[num_traj_per_task={num_traj_per_task}] Filtered {len(trajectory_ids)} -> "
+            f"[{', '.join(tag)}] Filtered {len(trajectory_ids)} -> "
             f"{len(filtered_ids)} trajectories ({len(task_count)} tasks)"
         )
         return filtered_ids, filtered_lengths
@@ -935,12 +958,18 @@ class LeRobotSingleDataset(Dataset):
         def is_main():
             return (not dist.is_initialized()) or dist.get_rank() == 0
 
-        # Skip cache when num_traj_per_task is set — cached steps were built on
-        # the full dataset, so the pickle on disk would re-load all trajectories.
+        # Skip cache whenever a per-trajectory filter is active — cached steps
+        # were built on the full dataset, so the pickle on disk would re-load
+        # all trajectories and `__getitem__` would later sample trajectory_ids
+        # not in the filtered set, raising "Error finding trajectory index".
         num_traj_per_task = self.data_cfg.get("num_traj_per_task", None) if self.data_cfg else None
-        if num_traj_per_task is not None:
+        task_whitelist = self.data_cfg.get("task_whitelist", None) if self.data_cfg else None
+        if num_traj_per_task is not None or task_whitelist:
             all_steps = self._get_all_steps_single_process()
-            print(f"[num_traj_per_task={num_traj_per_task}] Built {len(all_steps)} steps (no cache)")
+            tag = []
+            if task_whitelist: tag.append(f"task_whitelist={list(task_whitelist)}")
+            if num_traj_per_task is not None: tag.append(f"num_traj_per_task={num_traj_per_task}")
+            print(f"[{', '.join(tag)}] Built {len(all_steps)} steps (no cache)")
             return all_steps
 
         config_key = self._get_steps_config_key()
