@@ -46,10 +46,22 @@ def _env_step_chunk(env_pool, env_idx, action_chunk_unnorm, chunk_len, record_fr
 
 
 def _env_dummy_steps(env_pool, env_idx, n_steps):
-    """Execute dummy actions (warmup). Returns final obs."""
+    """Execute dummy actions (warmup). Returns final obs.
+
+    On worker hang/crash, returns a zero-obs placeholder instead of raising —
+    matches `_env_step_chunk`'s recovery so a single env's failure doesn't
+    kill the entire rollout thread (the affected episode just becomes a
+    silent failure for this iter; auto-reset will recover the env next iter).
+    """
     obs = None
     for _ in range(n_steps):
-        obs, _, _ = env_pool.step_env(env_idx, DUMMY_ACTION)
+        try:
+            obs, _, _ = env_pool.step_env(env_idx, DUMMY_ACTION)
+        except RuntimeError as e:
+            print(f"  [WARNING] env {env_idx} dummy step failed: {e}", flush=True)
+            return {"primary_image": np.zeros((256, 256, 3), dtype=np.uint8),
+                    "wrist_image": np.zeros((256, 256, 3), dtype=np.uint8),
+                    "state": np.zeros(8, dtype=np.float32)}
     return obs
 
 
@@ -159,22 +171,36 @@ def action_token_collect_group_steplock(
         batch_props = [np.array(obs_list[g]["state"], dtype=np.float32) for g in active_ids]
 
         print(f"  [VLA forward] batch={len(batch_images)}, active_envs={len(active_ids)}", flush=True)
+        # Build props_t up-front so Pi05's fused forward can also use it for
+        # diffusion conditioning (it needs `state`).
+        props_t = torch.tensor(np.array(batch_props), dtype=torch.float32).to(device)
         if encoder_mode == "rlt_ori":
-            # rlt_ori path: one fused VLM forward yields full hidden state +
-            # action_queries + vla_actions; feed compacted image tokens to
-            # the RL Token encoder (mirrors BatchInferenceServer._loop and
-            # eval_helpers_rlt_ori_zhanghe).
-            from AlphaBrain.training.reinforcement_learning.algos.RLT_ori import (
-                get_vla_hidden_states_and_action, compact_by_mask,
+            from AlphaBrain.training.reinforcement_learning.algos.RLT_ori.pi05_inference_zhanghe import (
+                is_pi05, get_pi05_rl_state_and_action,
             )
-            last_hidden, encoder_mask, _act_mask, action_queries, vla_actions = \
-                get_vla_hidden_states_and_action(
-                    frozen_vla,
-                    batch_images=batch_images, instructions=batch_instrs,
-                    image_only=True,
+            if is_pi05(frozen_vla):
+                rl_tokens, vla_actions = get_pi05_rl_state_and_action(
+                    frozen_vla, encoder,
+                    batch_images=batch_images,
+                    instructions=batch_instrs,
+                    batch_props=props_t,
                 )
-            dense, kp_mask = compact_by_mask(last_hidden, encoder_mask)
-            rl_tokens = encoder.encode(dense.float(), key_padding_mask=kp_mask)
+                action_queries = None
+            else:
+                # Qwen rlt_ori path: one fused VLM forward gives full hidden
+                # state + action_queries + vla_actions; feed compacted
+                # image-token slice into the RL Token encoder.
+                from AlphaBrain.training.reinforcement_learning.algos.RLT_ori import (
+                    get_vla_hidden_states_and_action, compact_by_mask,
+                )
+                last_hidden, encoder_mask, _act_mask, action_queries, vla_actions = \
+                    get_vla_hidden_states_and_action(
+                        frozen_vla,
+                        batch_images=batch_images, instructions=batch_instrs,
+                        image_only=True,
+                    )
+                dense, kp_mask = compact_by_mask(last_hidden, encoder_mask)
+                rl_tokens = encoder.encode(dense.float(), key_padding_mask=kp_mask)
         else:
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 action_queries, vla_actions = frozen_vla.get_vla_action(
@@ -187,7 +213,6 @@ def action_token_collect_group_steplock(
 
         # ── Step 2: Batch actor ──
         _t0 = time.time()
-        props_t = torch.tensor(np.array(batch_props), dtype=torch.float32).to(device)
 
         # Slice VLA actions for actor if actor uses shorter chunk
         if actor_chunk_len < vla_actions.size(1):
@@ -406,24 +431,38 @@ def action_token_collect_multitask_steplock(
         batch_instrs = [task_descriptions[g] for g in active_ids]
         batch_props = [np.array(obs_list[g]["state"], dtype=np.float32) for g in active_ids]
 
+        # Build props_t up-front so Pi05's fused forward can use it for
+        # diffusion conditioning (state).
+        props_t = torch.tensor(np.array(batch_props), dtype=torch.float32).to(device)
         if encoder_mode == "rlt_ori":
-            from AlphaBrain.training.reinforcement_learning.algos.RLT_ori import (
-                get_vla_hidden_states_and_action, compact_by_mask,
+            from AlphaBrain.training.reinforcement_learning.algos.RLT_ori.pi05_inference_zhanghe import (
+                is_pi05, get_pi05_rl_state_and_action,
             )
-            last_hidden, encoder_mask, _act_mask, action_queries, vla_actions = \
-                get_vla_hidden_states_and_action(
-                    frozen_vla,
-                    batch_images=batch_images, instructions=batch_instrs,
-                    image_only=True,
+            if is_pi05(frozen_vla):
+                rl_tokens, vla_actions = get_pi05_rl_state_and_action(
+                    frozen_vla, encoder,
+                    batch_images=batch_images,
+                    instructions=batch_instrs,
+                    batch_props=props_t,
                 )
-            dense, kp_mask = compact_by_mask(last_hidden, encoder_mask)
-            rl_tokens = encoder.encode(dense.float(), key_padding_mask=kp_mask)
+                action_queries = None
+            else:
+                from AlphaBrain.training.reinforcement_learning.algos.RLT_ori import (
+                    get_vla_hidden_states_and_action, compact_by_mask,
+                )
+                last_hidden, encoder_mask, _act_mask, action_queries, vla_actions = \
+                    get_vla_hidden_states_and_action(
+                        frozen_vla,
+                        batch_images=batch_images, instructions=batch_instrs,
+                        image_only=True,
+                    )
+                dense, kp_mask = compact_by_mask(last_hidden, encoder_mask)
+                rl_tokens = encoder.encode(dense.float(), key_padding_mask=kp_mask)
         else:
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 action_queries, vla_actions = frozen_vla.get_vla_action(
                     batch_images=batch_images, instructions=batch_instrs)
             rl_tokens = encoder.encode(action_queries)
-        props_t = torch.tensor(np.array(batch_props), dtype=torch.float32).to(device)
 
         if actor_chunk_len < vla_actions.size(1):
             vla_actions_for_actor = vla_actions[:, :actor_chunk_len, :]

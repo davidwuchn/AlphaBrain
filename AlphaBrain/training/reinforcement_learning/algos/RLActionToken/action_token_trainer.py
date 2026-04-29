@@ -147,36 +147,8 @@ class BatchInferenceServer:
             batch_props  = [r[2] for r in reqs]   # prop_state per request (or None)
 
             with torch.no_grad():
-                if self.encoder_mode == "rlt_ori":
-                    # Reference-track path: one VLM forward gives full hidden +
-                    # action_queries + vla_actions; compact the image-token
-                    # slice into z_{1:M} and feed RLT_ori encoder.
-                    from AlphaBrain.training.reinforcement_learning.algos.RLT_ori import (
-                        get_vla_hidden_states_and_action,
-                        compact_by_mask,
-                        pad_mask_from_attention,
-                    )
-                    last_hidden, encoder_mask, _action_mask, action_queries, vla_actions = \
-                        get_vla_hidden_states_and_action(
-                            self.frozen_vla,
-                            batch_images=batch_images,
-                            instructions=batch_instrs,
-                            image_only=True,
-                        )
-                    dense, kp_mask = compact_by_mask(last_hidden, encoder_mask)
-                    rl_tokens = self.encoder.encode(
-                        dense.float(), key_padding_mask=kp_mask
-                    )                                                              # (B, 1, H)
-                else:
-                    with torch.autocast("cuda", dtype=torch.bfloat16):
-                        action_queries, vla_actions = self.frozen_vla.get_vla_action(
-                            batch_images=batch_images,
-                            instructions=batch_instrs,
-                        )
-                    rl_tokens = self.encoder.encode(action_queries)                # (B, 1, D)
-
-                # Stack proprioceptive states for actor/critic
-                B = rl_tokens.size(0)
+                # Build props_t up-front so the Pi05 fused forward (which needs
+                # state for diffusion conditioning) can also use it.
                 if batch_props[0] is not None:
                     props_list = []
                     for p in batch_props:
@@ -187,6 +159,54 @@ class BatchInferenceServer:
                     props_t = torch.stack(props_list).to(self.device)             # (B, prop_dim)
                 else:
                     props_t = None
+
+                if self.encoder_mode == "rlt_ori":
+                    # Pi05 (PaliGemmaPi05) takes a different inference path
+                    # entirely (no in-stream action tokens; action chunk comes
+                    # from the flow-matching head). Dispatch on framework type.
+                    from AlphaBrain.training.reinforcement_learning.algos.RLT_ori.pi05_inference_zhanghe import (
+                        is_pi05, get_pi05_rl_state_and_action,
+                    )
+                    if is_pi05(self.frozen_vla):
+                        rl_tokens, vla_actions = get_pi05_rl_state_and_action(
+                            self.frozen_vla, self.encoder,
+                            batch_images=batch_images,
+                            instructions=batch_instrs,
+                            batch_props=props_t,
+                        )
+                        # Pi05 has no separate action_queries concept; keep a
+                        # placeholder so downstream code that may reference it
+                        # doesn't NameError.
+                        action_queries = None
+                    else:
+                        # Qwen rlt_ori: one VLM forward gives full hidden +
+                        # action_queries + vla_actions; compact image-token
+                        # slice into z_{1:M} and feed RLT_ori encoder.
+                        from AlphaBrain.training.reinforcement_learning.algos.RLT_ori import (
+                            get_vla_hidden_states_and_action,
+                            compact_by_mask,
+                            pad_mask_from_attention,
+                        )
+                        last_hidden, encoder_mask, _action_mask, action_queries, vla_actions = \
+                            get_vla_hidden_states_and_action(
+                                self.frozen_vla,
+                                batch_images=batch_images,
+                                instructions=batch_instrs,
+                                image_only=True,
+                            )
+                        dense, kp_mask = compact_by_mask(last_hidden, encoder_mask)
+                        rl_tokens = self.encoder.encode(
+                            dense.float(), key_padding_mask=kp_mask
+                        )                                                              # (B, 1, H)
+                else:
+                    with torch.autocast("cuda", dtype=torch.bfloat16):
+                        action_queries, vla_actions = self.frozen_vla.get_vla_action(
+                            batch_images=batch_images,
+                            instructions=batch_instrs,
+                        )
+                    rl_tokens = self.encoder.encode(action_queries)                # (B, 1, D)
+
+                B = rl_tokens.size(0)
 
                 # Slice VLA actions to actor_chunk_len if specified
                 C_actor = self.actor_chunk_len

@@ -16,8 +16,8 @@ modes:
     type: "eval"
     checkpoint: "./results/training/Pi05-goal-5traj-openpi/checkpoints/steps_30000"
     task_suite: "libero_goal"
-    num_trials: 10
+    num_trials: 50
     host: "127.0.0.1"
-    port: 5795
-    gpu_id: 0
+    port: 5796
+    gpu_id: 3
     use_bf16: true

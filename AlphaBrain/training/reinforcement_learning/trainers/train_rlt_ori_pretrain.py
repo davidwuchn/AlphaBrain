@@ -140,13 +140,28 @@ def _forward_recon_loss(
     gathering a dense ``(B, M_max, H)`` tensor indexed by each sample's
     kept positions.
     """
-    last_hidden, attention_mask, _action_mask = get_vla_hidden_states(
-        vla,
-        batch_images=batch_images,
-        instructions=instructions,
-        image_only=image_only,
-        drop_action_tokens=drop_action_tokens,
-    )
+    # Framework dispatch: Qwen path keeps the original behavior; Pi05/PaliGemma
+    # routes through the local adapter (no in-stream action tokens, prefix-only
+    # representation). See vla_features_pi05_zhanghe.py for caveats.
+    if hasattr(vla, "qwen_vl_interface"):
+        last_hidden, attention_mask, _action_mask = get_vla_hidden_states(
+            vla,
+            batch_images=batch_images,
+            instructions=instructions,
+            image_only=image_only,
+            drop_action_tokens=drop_action_tokens,
+        )
+    else:
+        from AlphaBrain.training.reinforcement_learning.algos.RLT_ori.vla_features_pi05_zhanghe import (
+            get_vla_hidden_states_pi05,
+        )
+        last_hidden, attention_mask, _action_mask = get_vla_hidden_states_pi05(
+            vla,
+            batch_images=batch_images,
+            instructions=instructions,
+            image_only=image_only,
+            drop_action_tokens=drop_action_tokens,
+        )
     # Compact the (B, L, H) sequence to (B, M_max, H) by gathering the kept
     # positions per sample. Different samples can have different kept
     # counts (variable image-token counts per image resolution); we pad to
@@ -235,7 +250,21 @@ def run_rlt_ori_pretrain(args):
         vla.train()
         logger.info(f"VLA will be jointly fine-tuned with alpha_vla = {alpha_vla}")
 
-    hidden_dim = vla.qwen_vl_interface.model.config.hidden_size
+    # Hidden-dim source dispatches on framework type (matches the dispatch in
+    # _forward_recon_loss above). chunk_len is uniform across frameworks.
+    if hasattr(vla, "qwen_vl_interface"):
+        hidden_dim = vla.qwen_vl_interface.model.config.hidden_size
+    elif hasattr(vla, "vlm_interface") and hasattr(vla.vlm_interface, "hidden_size"):
+        # Pi05/PaliGemma exposes hidden_size directly on the interface
+        # (custom PaliGemmaVLM, not an HF model with .config.hidden_size).
+        hidden_dim = vla.vlm_interface.hidden_size
+    else:
+        hidden_dim = getattr(vla, "_get_vlm_hidden_size", lambda: None)()
+        if hidden_dim is None:
+            raise RuntimeError(
+                f"Cannot determine VLM hidden_size for {type(vla).__name__}; "
+                f"add explicit branch in train_rlt_ori_pretrain.run_rlt_ori_pretrain."
+            )
     chunk_len = vla.chunk_len
 
     # Encoder-decoder at the VLA hidden dim (reference: no extra bottleneck proj)

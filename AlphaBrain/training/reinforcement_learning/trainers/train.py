@@ -29,6 +29,14 @@ from AlphaBrain.training.reinforcement_learning._bootstrap import setup
 
 setup()  # load .env, set TOKENIZERS_PARALLELISM, configure logging — before heavy imports
 
+# Register PR_SET_PDEATHSIG so when the launcher (bash) is killed — even
+# via SIGKILL, which bash can't trap — the kernel sends us SIGTERM and we
+# exit cleanly. Without this, train.py orphans to init and keeps the GPU
+# allocated alongside its 64 libero_env_worker subprocesses, which then
+# also orphan and deadlock the GPU until manual cleanup.
+from AlphaBrain.training.reinforcement_learning.common.parent_death import set_die_with_parent
+set_die_with_parent()
+
 from AlphaBrain.training.reinforcement_learning.trainers.train_args import parse_args
 from AlphaBrain.training.reinforcement_learning.trainers.train_pretrain import run_pretrain
 from AlphaBrain.training.reinforcement_learning.trainers.train_rl_offpolicy import run_rl_offpolicy
