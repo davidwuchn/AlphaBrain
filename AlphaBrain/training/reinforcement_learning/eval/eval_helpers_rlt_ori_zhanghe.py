@@ -50,7 +50,14 @@ def _eval_deterministic_local_rlt_ori(
     Returns: list of (ep_idx, state_idx, success) tuples, one per episode
     in `episode_indices`.
     """
-    from AlphaBrain.training.reinforcement_learning.envs.libero_env import LiberoEnv
+    # Use the socket-IPC env (same as rollout) instead of the legacy
+    # pipe-IPC LiberoEnv. The pipe IPC deadlocks on some container
+    # configurations (cluster jobs) where stderr buffering or fd
+    # inheritance differs from local. Socket IPC has settimeout()
+    # protection so a hung worker can't freeze the whole eval thread.
+    from AlphaBrain.training.reinforcement_learning.envs.persistent_env_pool import (
+        _FastLiberoEnv as LiberoEnv,
+    )
     from AlphaBrain.training.reinforcement_learning.common.rollout import (
         DUMMY_ACTION,
         _postprocess_action,
