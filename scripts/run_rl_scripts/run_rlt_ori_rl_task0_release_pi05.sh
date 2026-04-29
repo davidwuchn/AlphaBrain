@@ -29,6 +29,11 @@ export LIBERO_HOME="${LIBERO_HOME:-/path/to/LIBERO}"
 export TOKENIZERS_PARALLELISM=false
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
 
+# Avoid HF hub fetch (offline-restricted containers) and sentencepiece
+# fallback by pointing PaliGemmaPi05._init_tokenizer at the local tokenizer
+# dir. Mirrors what run_pi05_goal_*_finetune.sh already exports.
+export PALIGEMMA_TOKENIZER_PATH="${PALIGEMMA_TOKENIZER_PATH:-/datasets/peligemma}"
+
 GPU_ID=${1:-0}
 TASK_ID=${TASK_ID:-0}
 VARIANT=${VARIANT:-1traj}
