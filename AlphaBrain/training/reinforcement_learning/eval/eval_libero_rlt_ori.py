@@ -91,7 +91,11 @@ def _eval_one_task_rlt_ori(
     builds ``rl_token`` via the image-only / compact-by-mask path so the
     encoder sees the same inputs it saw during training rollouts.
     """
-    from AlphaBrain.training.reinforcement_learning.envs.libero_env import LiberoEnv
+    # Use socket-IPC env (matches rollout). The legacy pipe-IPC LiberoEnv
+    # deadlocks on stderr buffering in some container configurations.
+    from AlphaBrain.training.reinforcement_learning.envs.persistent_env_pool import (
+        _FastLiberoEnv as LiberoEnv,
+    )
     from AlphaBrain.training.reinforcement_learning.common.rollout import (
         DUMMY_ACTION,
         _postprocess_action,
@@ -135,23 +139,36 @@ def _eval_one_task_rlt_ori(
 
                 if action_cache is None or cache_idx >= chunk_len:
                     images = [[obs["primary_image"], obs["wrist_image"]]]
-                    # rlt_ori encoder path (mirrors BatchInferenceServer._loop
-                    # in action_token_trainer.py for encoder_mode="rlt_ori").
-                    last_hidden, encoder_mask, _action_mask, _action_queries, vla_actions = \
-                        get_vla_hidden_states_and_action(
-                            frozen_vla,
-                            batch_images=images,
-                            instructions=[task_desc],
-                            image_only=True,
-                        )
-                    dense, kp_mask = compact_by_mask(last_hidden, encoder_mask)
-                    rl_token = encoder.encode(dense.float(), key_padding_mask=kp_mask)
-
-                    if vla_actions.size(1) > chunk_len:
-                        vla_actions = vla_actions[:, :chunk_len, :]
                     prop_state = torch.tensor(
                         np.array(obs["state"], dtype=np.float32)
                     ).unsqueeze(0).to(device)
+                    # rlt_ori encoder path: Pi05 fuses prefix Gemma forward +
+                    # diffusion in one call (see pi05_inference_zhanghe);
+                    # Qwen path mirrors BatchInferenceServer._loop in
+                    # action_token_trainer.py for encoder_mode="rlt_ori".
+                    from AlphaBrain.training.reinforcement_learning.algos.RLT_ori.pi05_inference_zhanghe import (
+                        is_pi05 as _is_pi05, get_pi05_rl_state_and_action,
+                    )
+                    if _is_pi05(frozen_vla):
+                        rl_token, vla_actions = get_pi05_rl_state_and_action(
+                            frozen_vla, encoder,
+                            batch_images=images,
+                            instructions=[task_desc],
+                            batch_props=prop_state,
+                        )
+                    else:
+                        last_hidden, encoder_mask, _action_mask, _action_queries, vla_actions = \
+                            get_vla_hidden_states_and_action(
+                                frozen_vla,
+                                batch_images=images,
+                                instructions=[task_desc],
+                                image_only=True,
+                            )
+                        dense, kp_mask = compact_by_mask(last_hidden, encoder_mask)
+                        rl_token = encoder.encode(dense.float(), key_padding_mask=kp_mask)
+
+                    if vla_actions.size(1) > chunk_len:
+                        vla_actions = vla_actions[:, :chunk_len, :]
                     action_t, _ = actor(rl_token, vla_actions, prop_state, deterministic=True)
                     action_np = action_t[0].cpu().numpy()
                     action_cache = _unnormalize(action_np, action_norm_stats)
