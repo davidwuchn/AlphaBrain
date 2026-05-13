@@ -39,7 +39,7 @@ Two concrete reasons:
    full VLM token sequence, which means each new VLA needs its own
    feature-extraction code that understands that VLA's token layout
    (cf. `algos/RLT/vla_features.py` for Qwen vs
-   `vla_features_pi05_zhanghe.py` for Pi05 — two largely independent
+   `vla_features_pi05.py` for Pi05 — two largely independent
    implementations).
 
 `RLT` is the more recent addition: it's closer to the paper's exact
@@ -49,15 +49,18 @@ tracks share the trainer, rollout, and eval infrastructure; only the
 encoder/decoder class and the `--encoder_mode {action_token, rlt}` flag
 differ. Full design notes for each are in their `algos/<track>/README.md`.
 
-### Backbone support
+### Backbone × track support matrix
 
-Both tracks dispatch on VLA framework type, so the same encoder family
-works with:
+|                 | Qwen (`Qwenvl_OFT`) | Pi05 (`PaliGemmaPi05`) |
+|:----------------|:--------------------|:-----------------------|
+| **`RLT`**       | ✓                   | ✓                      |
+| **`RLT_a`**     | ✓                   | roadmapped — not wired yet |
 
-| Backbone | Framework | Use |
-|:---------|:----------|:----|
-| **Qwen** | `Qwenvl_OFT` (Qwen2.5-VL-3B + MLP head) | `BACKBONE=qwen` |
-| **Pi05** | `PaliGemmaPi05` (SigLIP + Gemma 2B + flow matching) | `BACKBONE=pi05 VARIANT={1traj,5traj}` |
+`RLT_a` × Pi05 isn't currently supported: `RLT_a`'s encoder consumes the
+VLA's action-query hidden states (which `Qwenvl_OFT` exposes via
+`get_vla_action`), but `PaliGemmaPi05`'s flow-matching head outputs
+actions directly without an "action-query slice" equivalent — that
+adapter is on the roadmap.
 
 ---
 
@@ -68,19 +71,17 @@ works with:
 ├── README.md
 ├── run_pi05_finetune.sh       # VLA finetune (Pi05; pick variant via env)
 ├── run_rlt_pretrain.sh        # Phase-1: RLT encoder pretrain
-├── run_rlt_rl.sh              # Phase-2: TD3 RL on the RLT track
+├── run_rlt_rl.sh              # Phase-2: TD3 RL on the RLT track (Qwen or Pi05)
 │
-├── pi05_eval.yaml             # configs for 3 Pi05 VLA-only eval modes
-├── run_eval_pi05_latest_zhanghe.sh    # auto-pick latest Pi05 ckpt → VLA-only eval
-├── run_eval_action_token.sh   # offline eval, RLT_a (action_token) policy
-├── run_eval_rlt.sh            # offline eval, RLT policy — single iter
-├── run_eval_rlt_all_iters.sh  # offline eval, RLT policy — all ckpts of one run
+├── pi05_eval.yaml             # configs for Pi05 VLA-only eval modes
+├── run_eval_rlt.sh            # offline eval, RLT policy (single iter or all iters)
+├── run_eval_action_token.sh   # offline eval, RLT_a policy (Qwen only)
 │
 ├── example_results/           # reference plots / summaries
 └── example_scripts/           # legacy / one-off launchers
 ```
 
-(End-to-end `RLT_a` training launcher isn't in this dir; see the
+(End-to-end `RLT_a` training launcher isn't in this dir; see
 `AlphaBrain/training/reinforcement_learning/algos/RLT_a/README.md`.)
 
 ---
@@ -129,24 +130,19 @@ For the `RLT_a` track, see `AlphaBrain/training/reinforcement_learning/algos/RLT
 ### 4 — Eval
 
 ```bash
-# VLA-only (no RL): server + LIBERO client
+# VLA-only (no RL): policy server + LIBERO client. The yaml has one mode
+# block per finetune variant; edit `checkpoint:` to point at the desired
+# steps_X dir before running.
 bash scripts/run_base_vla/eval.sh pi05_goal_5traj_eval scripts/run_rl_scripts/pi05_eval.yaml
 
-# VLA-only, latest-ckpt wrapper (rewrites the yaml `checkpoint:` line in place)
-RUN_DIR=results/training/Pi05-goal-5traj-openpi \
-MODE=pi05_goal_5traj_eval \
-    bash scripts/run_rl_scripts/run_eval_pi05_latest_zhanghe.sh
-
-# Offline eval of one RLT RL ckpt (50 ep / task, multi-task sharding inside)
-bash scripts/run_rl_scripts/run_eval_rlt.sh
-
-# Offline eval of EVERY iter ckpt in one RL run (parallel across GPUs)
+# RLT offline eval: defaults to all iter ckpts under RUN_DIR, parallel
+# across GPUS. Pass ITER=00300 to eval one ckpt only.
 RUN_DIR=results/rlt_training/<run>/rl_offpolicy \
 VLA_CKPT=results/training/Pi05-goal-5traj-openpi/checkpoints/steps_30000 \
 GPUS="0 1 2" TASK_IDS=0 N_EPS=50 \
-    bash scripts/run_rl_scripts/run_eval_rlt_all_iters.sh
+    bash scripts/run_rl_scripts/run_eval_rlt.sh
 
-# Offline eval, RLT_a track — 10 tasks split across 3 GPUs
+# RLT_a offline eval (Qwen only): 10 tasks split across 3 GPUs
 bash scripts/run_rl_scripts/run_eval_action_token.sh <RUN_DIR>
 ```
 

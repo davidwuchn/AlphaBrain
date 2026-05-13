@@ -9,7 +9,7 @@
 #   BACKBONE=pi05  VARIANT=5traj            PaliGemmaPi05 + flow matching (50-demo)
 #
 # Phase-2 RL dispatches on framework type (is_pi05) inside the trainer;
-# the Pi05 path uses pi05_inference_zhanghe.py to fuse PaliGemma prefix
+# the Pi05 path uses pi05_inference.py to fuse PaliGemma prefix
 # Gemma forward + flow-matching diffusion per rollout step.
 #
 # Phase-1 (encoder pretrain) must already have produced encoder.pt — run
