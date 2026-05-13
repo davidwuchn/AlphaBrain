@@ -167,19 +167,31 @@ ITER=00300 RUN_DIR=... VLA_CKPT=... GPUS=0 \
 
 ## Switching backbones / tracks
 
+Both `run_rlt_pretrain.sh` and `run_rlt_rl.sh` take two env-var knobs:
+
+- `TRACK={rlt,rlt_a}` — selects the encoder family
+- `BACKBONE={qwen,pi05}` — selects the VLA family
+
 ```bash
 # Same flow, but Qwen backbone (default for run_rlt_rl.sh)
 bash scripts/run_rl_scripts/run_rlt_pretrain.sh 0
 bash scripts/run_rl_scripts/run_rlt_rl.sh 0
-# RLT eval works the same
 
-# Same flow, but Pi05 1traj instead of 5traj
+# Pi05 1traj instead of 5traj
+CKPT_PATH=results/training/Pi05-goal-1traj-openpi/checkpoints/steps_30000 \
+    bash scripts/run_rl_scripts/run_rlt_pretrain.sh 0
 BACKBONE=pi05 VARIANT=1traj TASK_ID=0 bash scripts/run_rl_scripts/run_rlt_rl.sh 0
 
-# RLT_a track (action-token encoder) — Qwen only currently
-# Training entry point isn't in this dir; see algos/RLT_a/README.md.
+# RLT_a track (action-token encoder, multi-task, Qwen only)
+TRACK=rlt_a bash scripts/run_rl_scripts/run_rlt_pretrain.sh 0
+TRACK=rlt_a bash scripts/run_rl_scripts/run_rlt_rl.sh 0
 bash scripts/run_rl_scripts/run_eval_rlt_a.sh <RUN_DIR>
 ```
+
+`TRACK=rlt_a` switches the trainer to `--encoder_mode action_token`,
+bottleneck `D=256`, 4 encoder heads, and multi-task rollout
+(`--all_tasks` instead of `--task_id`). `TRACK=rlt_a` with `BACKBONE=pi05`
+errors out — Pi05 support is roadmapped.
 
 For VLA-only eval (baseline SR before any RL), point the standard
 LIBERO server at the finetune ckpt:

@@ -1,17 +1,23 @@
 #!/bin/bash
-# RLT Phase-1 pretraining (encoder-decoder reconstruction over
-# frozen VLA hidden states). Strict-reference mode: --image_only
-# keeps only image-token positions as z_{1:M} (Fig. 2, footnote 1).
+# Phase-1 encoder pretrain. Two tracks share this launcher:
 #
-# Duration model — matches the sibling RLT_a pretrain:
-#   - `--pretrain_max_steps N`: stop after N optimizer.step() calls.
-#     When >0 this is the hard budget; --pretrain_epochs becomes an
-#     upper cap that's usually never hit.
-#   - `--pretrain_epochs E`: max # of dataset passes. If you want a
-#     pure epoch-driven run, set MAX_STEPS=0 and dial EPOCHS.
-# The sibling RLT_a pretrain used 500 epochs × 3000 obs / bs 32
-# ≈ 46k steps. We default here to MAX_STEPS=30000 to match that order
-# (≈ 30 min on an A800 for the 1-traj LIBERO-goal demo set at batch 8).
+#   TRACK=rlt    (default)  paper-faithful RL Token encoder/decoder over the
+#                           full VLM token stream; reconstruction loss against
+#                           stop-gradient VLA hidden states. Uses --phase pretrain_rlt.
+#
+#   TRACK=rlt_a             action-token variant — encoder consumes the
+#                           action-query slice + Linear(H→D=256) bottleneck.
+#                           Uses --phase pretrain (the original recipe).
+#
+# Usage:
+#   bash scripts/run_rl_scripts/run_rlt_pretrain.sh [GPU_ID]                 # RLT, GPU 0
+#   TRACK=rlt_a bash scripts/run_rl_scripts/run_rlt_pretrain.sh 0            # RLT_a, GPU 0
+#
+# Common env overrides:
+#   CKPT_PATH    VLA finetune checkpoint to encode (default: QwenOFT-1traj)
+#   RUN_TAG     subdir tag under results/rlt_training/
+#   MAX_STEPS    pretrain step budget (default 30000)
+#   BATCH_SIZE   pretrain batch size (default 8 for rlt, 32 for rlt_a)
 set -euo pipefail
 cd "${ALPHABRAIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
 
@@ -23,77 +29,104 @@ export LIBERO_HOME="${LIBERO_HOME:-/path/to/LIBERO}"
 export TOKENIZERS_PARALLELISM=false
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
 
-# ── knobs ─────────────────────────────────────────────────────────────────
 GPU_ID=${1:-0}
-MAX_STEPS=${MAX_STEPS:-30000}           # hard gradient-step budget (0 = off)
-EPOCHS=${EPOCHS:-10000}                 # epoch cap (mostly irrelevant when MAX_STEPS>0)
-BATCH_SIZE=${BATCH_SIZE:-8}
-LR=${LR:-1e-4}
-ALPHA_VLA=${ALPHA_VLA:-0.0}             # >0 → joint VLA SFT (Alg. 1, line 3)
-ENCODER_LAYERS=${ENCODER_LAYERS:-2}
-DECODER_LAYERS=${DECODER_LAYERS:-2}
-ENCODER_HEADS=${ENCODER_HEADS:-8}
-MAX_LEN=${MAX_LEN:-4096}
+TRACK=${TRACK:-rlt}
 SEED=${SEED:-42}
-RUN_TAG=${RUN_TAG:-1traj_libero_goal}
-
-CKPT_PATH="${CKPT_PATH:-results/training/0324-zh-QwenOFT-1traj-libero_goal/final_model}"
-# Demo config shipped with the 1-traj SFT ckpt — has `datasets.vla_data.data_root_dir`
-# and `dataset_mix: libero_goal` already set; the DataLoader pulls LeRobot
-# LIBERO data from $LIBERO_DATA_ROOT/libero_goal_no_noops_1.0.0_lerobot.
-DEMO_CONFIG="${DEMO_CONFIG:-${CKPT_PATH}/framework_config.yaml}"
+CKPT_PATH="${CKPT_PATH:-results/training/QwenOFT-5traj-libero_goal/final_model}"
 
 TIMESTAMP=$(date +%m%d_%H%M)
-OUTPUT_DIR="results/rlt_training/${RUN_TAG}_${TIMESTAMP}/pretrain"
 
 if [ ! -d "${CKPT_PATH}" ]; then
-    echo "ERROR: VLA ckpt not found: ${CKPT_PATH}"
+    echo "ERROR: VLA ckpt not found: ${CKPT_PATH}" >&2
     exit 1
 fi
-if [ ! -f "${DEMO_CONFIG}" ]; then
-    echo "WARNING: demo config not found: ${DEMO_CONFIG}"
-    echo "         Will fall back to random-rollout observations (deviates from reference)."
-    DEMO_FLAG=""
-else
-    DEMO_FLAG="--demo_config ${DEMO_CONFIG}"
-fi
 
-echo "============================================================"
-echo " RLT Phase-1 pretrain  (GPU ${GPU_ID})"
-echo "   ckpt:        ${CKPT_PATH}"
-echo "   demo cfg:    ${DEMO_CONFIG:-<none>}"
-echo "   budget:      max_steps=${MAX_STEPS}  epochs_cap=${EPOCHS}  batch=${BATCH_SIZE}"
-echo "   alpha_vla:   ${ALPHA_VLA}"
-echo "   output:      ${OUTPUT_DIR}"
-echo "============================================================"
+case "${TRACK}" in
+    rlt)
+        # Paper-faithful track: pretrain_rlt, full VLM tokens, encoder-decoder
+        # cross-attention. Demo-driven via --demo_config (from the SFT ckpt's
+        # own framework_config.yaml) if present; otherwise random rollouts.
+        RUN_TAG="${RUN_TAG:-rlt_$(basename ${CKPT_PATH%/*})}"
+        OUTPUT_DIR="results/rlt_training/${RUN_TAG}_${TIMESTAMP}/pretrain"
+        MAX_STEPS=${MAX_STEPS:-30000}
+        EPOCHS=${EPOCHS:-10000}
+        BATCH_SIZE=${BATCH_SIZE:-8}
+        LR=${LR:-1e-4}
+        ALPHA_VLA=${ALPHA_VLA:-0.0}
+        DEMO_CONFIG="${DEMO_CONFIG:-${CKPT_PATH}/framework_config.yaml}"
+        if [ -f "${DEMO_CONFIG}" ]; then DEMO_FLAG="--demo_config ${DEMO_CONFIG}"; else DEMO_FLAG=""; fi
 
-CUDA_VISIBLE_DEVICES=${GPU_ID} python AlphaBrain/training/reinforcement_learning/trainers/train.py \
-    --phase pretrain_rlt \
-    --ckpt_path "${CKPT_PATH}" \
-    --output_dir "${OUTPUT_DIR}" \
-    ${DEMO_FLAG} \
-    --suite libero_goal \
-    --all_tasks \
-    --image_only \
-    --encoder_layers ${ENCODER_LAYERS} \
-    --decoder_layers ${DECODER_LAYERS} \
-    --encoder_heads ${ENCODER_HEADS} \
-    --max_len ${MAX_LEN} \
-    --pretrain_epochs ${EPOCHS} \
-    --pretrain_max_steps ${MAX_STEPS} \
-    --pretrain_lr ${LR} \
-    --pretrain_batch_size ${BATCH_SIZE} \
-    --alpha_vla ${ALPHA_VLA} \
-    --seed ${SEED} \
-    --use_wandb \
-    --wandb_project AlphaBrain_RLT \
-    --run_name rlt_pretrain_${RUN_TAG}
+        echo "============================================================"
+        echo " RLT Phase-1 pretrain  (TRACK=rlt, GPU ${GPU_ID})"
+        echo "   ckpt:    ${CKPT_PATH}"
+        echo "   demo:    ${DEMO_CONFIG:-<none, falling back to random rollouts>}"
+        echo "   budget:  max_steps=${MAX_STEPS}  batch=${BATCH_SIZE}  lr=${LR}"
+        echo "   output:  ${OUTPUT_DIR}"
+        echo "============================================================"
 
-# ── how to change duration ───────────────────────────────────────────────
-# step-budget (paper-like):    MAX_STEPS=30000  bash scripts/run_rl_scripts/run_rlt_pretrain.sh 0
-# quick smoke:                 MAX_STEPS=500    bash scripts/run_rl_scripts/run_rlt_pretrain.sh 0
-# pure-epoch mode:             MAX_STEPS=0 EPOCHS=50  bash scripts/run_rl_scripts/run_rlt_pretrain.sh 0
-# joint VLA SFT:               ALPHA_VLA=1.0 MAX_STEPS=20000 bash ...
-# 5-traj ckpt:                 CKPT_PATH=results/training/QwenOFT-5traj-libero_goal/final_model \
-#                              RUN_TAG=5traj_libero_goal MAX_STEPS=30000 \
-#                              bash scripts/run_rl_scripts/run_rlt_pretrain.sh 0
+        CUDA_VISIBLE_DEVICES=${GPU_ID} python AlphaBrain/training/reinforcement_learning/trainers/train.py \
+            --phase pretrain_rlt \
+            --ckpt_path "${CKPT_PATH}" \
+            --output_dir "${OUTPUT_DIR}" \
+            ${DEMO_FLAG} \
+            --suite libero_goal \
+            --all_tasks \
+            --image_only \
+            --encoder_layers 2 \
+            --decoder_layers 2 \
+            --encoder_heads 8 \
+            --max_len 4096 \
+            --pretrain_epochs ${EPOCHS} \
+            --pretrain_max_steps ${MAX_STEPS} \
+            --pretrain_lr ${LR} \
+            --pretrain_batch_size ${BATCH_SIZE} \
+            --alpha_vla ${ALPHA_VLA} \
+            --seed ${SEED} \
+            --use_wandb \
+            --wandb_project AlphaBrain_RLT \
+            --run_name rlt_pretrain_${RUN_TAG}
+        ;;
+
+    rlt_a)
+        # Action-token track: pretrain on action-query slice, D=256 bottleneck,
+        # encoder_heads=4. Observations from random rollout (the original recipe).
+        RUN_TAG="${RUN_TAG:-rlt_a_$(basename ${CKPT_PATH%/*})}"
+        OUTPUT_DIR="results/rlt_training/${RUN_TAG}_${TIMESTAMP}/pretrain"
+        EPOCHS=${EPOCHS:-500}
+        BATCH_SIZE=${BATCH_SIZE:-32}
+        LR=${LR:-1e-4}
+
+        echo "============================================================"
+        echo " RLT_a Phase-1 pretrain  (TRACK=rlt_a, GPU ${GPU_ID})"
+        echo "   ckpt:    ${CKPT_PATH}"
+        echo "   recipe:  3000 rollout obs × 20 steps/reset, epochs=${EPOCHS}"
+        echo "   output:  ${OUTPUT_DIR}"
+        echo "============================================================"
+
+        CUDA_VISIBLE_DEVICES=${GPU_ID} python AlphaBrain/training/reinforcement_learning/trainers/train.py \
+            --phase pretrain \
+            --ckpt_path "${CKPT_PATH}" \
+            --output_dir "${OUTPUT_DIR}" \
+            --suite libero_goal \
+            --all_tasks \
+            --bottleneck_dim 256 \
+            --encoder_layers 2 \
+            --encoder_heads 4 \
+            --pretrain_n_obs 3000 \
+            --pretrain_steps_per_reset 20 \
+            --pretrain_epochs ${EPOCHS} \
+            --pretrain_lr ${LR} \
+            --pretrain_batch_size ${BATCH_SIZE} \
+            --vla_extract_batch_size 16 \
+            --num_envs_per_task 8 \
+            --seed ${SEED} \
+            --use_wandb \
+            --wandb_project AlphaBrain_RLT \
+            --run_name rlt_a_pretrain_${RUN_TAG}
+        ;;
+
+    *)
+        echo "ERROR: TRACK must be 'rlt' or 'rlt_a' (got '${TRACK}')" >&2
+        exit 1
+        ;;
+esac

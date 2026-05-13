@@ -135,7 +135,7 @@ sibling module rather than a replacement, so existing users of
 
 ## Entry points
 
-- **Train (Phase 1 + Phase 2)**: `scripts/run_rl_scripts/run_action_token_5traj_alltasks.sh`
+- **Train (Phase 1 + Phase 2)**: `TRACK=rlt_a bash scripts/run_rl_scripts/run_rlt_pretrain.sh` then `TRACK=rlt_a bash scripts/run_rl_scripts/run_rlt_rl.sh`
 - **Eval**: `scripts/run_rl_scripts/run_eval_rlt_a.sh`
 - **Recipe YAML**: `configs/rl_recipes/QwenOFT_LIBERO_ActionToken.yaml`
 - **Script-level README** (CLI flags, rollout math, gotchas): `scripts/run_rl_scripts/README.md`
