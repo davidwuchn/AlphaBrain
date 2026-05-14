@@ -83,21 +83,16 @@ class M1Inference:
         # "normalized_actions"; skip client-side unnormalization to avoid double-unnorm.
         self.skip_client_unnorm = False
         self.invert_gripper_after_unnorm = False  # Pi0/Pi0.5 without internal norm needs gripper invert
+        _PI0_FAMILY = ('PaliGemmaPi05', 'LlamaPi05', 'Pi0OFT')
         try:
             from AlphaBrain.model.framework.config_utils import read_mode_config
             _mc, _ = read_mode_config(Path(policy_ckpt_path))
             _fw_name = _mc.get('framework', {}).get('name', '')
             _norm_cfg = _mc.get('framework', {}).get('normalization', {})
-            # NOTE: 'PaliGemmaPi05' is the proper name for the π₀.₅ framework
-            # used in current configs; 'PaliGemmaPi0' is the legacy alias kept
-            # only for old checkpoints. Both must be in this list — without it,
-            # M1Inference falls through to client-side q99 unnormalization on
-            # top of the framework's MEAN_STD unnorm → double-unnorm → garbage actions.
-            _PI0_LIKE = ('PaliGemmaPi0', 'PaliGemmaPi05', 'Pi0OFT', 'LlamaPi0')
-            if _fw_name in _PI0_LIKE and _norm_cfg.get('enabled', False):
+            if _fw_name in _PI0_FAMILY and _norm_cfg.get('enabled', False):
                 self.skip_client_unnorm = True
                 logging.info(f"[M1Inference] Detected {_fw_name} with internal MEAN_STD norm → skipping client unnorm")
-            elif _fw_name in _PI0_LIKE and not _norm_cfg.get('enabled', False):
+            elif _fw_name in _PI0_FAMILY and not _norm_cfg.get('enabled', False):
                 self.invert_gripper_after_unnorm = True
                 logging.info(f"[M1Inference] Detected {_fw_name} without internal norm → will invert gripper after unnorm")
         except Exception as e:
@@ -312,7 +307,7 @@ class M1Inference:
         See primary _check_unnorm_key above.
         """
         if len(norm_stats) == 0:
-            # Models with internal normalization (Pi0/LlamaPi0) may have no
+            # Models with internal normalization (Pi0.5) may have no
             # dataset_statistics.json.  Return a sentinel key so downstream
             # code can proceed; the stats will be ignored when
             # skip_client_unnorm is True.

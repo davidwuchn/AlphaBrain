@@ -7,14 +7,9 @@ Original: openpi/src/openpi/models_pytorch/gemma_pytorch.py
 from __future__ import annotations
 from typing import Literal
 
-try:
-    import pytest
-except ImportError:
-    pytest = None  # not needed at runtime
-
 import torch
 from torch import nn
-from transformers import GemmaForCausalLM
+from transformers import Cache, GemmaForCausalLM
 try:
     from transformers import PaliGemmaForConditionalGeneration
 except ImportError:
@@ -106,7 +101,7 @@ class PaliGemmaWithExpertModel(nn.Module):
         self,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
-        past_key_values: list[torch.FloatTensor] | pytest.Cache | None = None,
+        past_key_values: list[torch.FloatTensor] | Cache | None = None,
         inputs_embeds: list[torch.FloatTensor] | None = None,
         use_cache: bool | None = None,
         adarms_cond: list[torch.Tensor] | None = None,
