@@ -216,7 +216,6 @@ else
                 --args.task-suite-name "${_suite}" \
                 --args.num-trials-per-task "${NUM_TRIALS}" \
                 --args.num-views "${EVAL_NUM_VIEWS:-2}" \
-                --args.max-steps "${EVAL_LIBERO_MAX_STEPS}" \
                 --args.video-out-path "${_suite_video}" \
                 2>&1 | tee "${_suite_log}"
         done
@@ -228,7 +227,6 @@ else
             --args.task-suite-name "${TASK_SUITE}" \
             --args.num-trials-per-task "${NUM_TRIALS}" \
             --args.num-views "${EVAL_NUM_VIEWS:-2}" \
-            --args.max-steps "${EVAL_LIBERO_MAX_STEPS}" \
             --args.video-out-path "${video_out_path}" \
             2>&1 | tee "${EVAL_LOG}"
     fi

@@ -8,8 +8,7 @@ End-to-end RL pipeline (assumes a pretrained VLA checkpoint is already on disk):
 ```
 
 VLA finetune itself isn't part of this directory's flow — it's a one-time
-upstream step. See `example_scripts/run_pi05_finetune.sh` for the Pi05
-recipe, or `configs/finetune_config.yaml` for Qwen.
+upstream step driven by `configs/finetune_config.yaml`.
 
 ---
 
@@ -81,7 +80,6 @@ adapter is on the roadmap.
 │
 ├── example_results/           # reference plots / summaries
 └── example_scripts/
-    ├── run_pi05_finetune.sh   # upstream VLA finetune (not in the RL flow)
     ├── pi05_eval.yaml         # VLA-only (no RL) eval configs
     └── ...                    # legacy / one-off launchers
 ```
@@ -96,8 +94,7 @@ adapter is on the roadmap.
 - A pretrained VLA checkpoint on disk. The releases assume either
   `QwenOFT-5traj-libero_goal/final_model` (Qwen) or
   `Pi05-goal-{1traj,5traj}-openpi/checkpoints/steps_30000` (Pi05). If you
-  don't have one yet, see `example_scripts/run_pi05_finetune.sh` (Pi05)
-  or `configs/finetune_config.yaml` (Qwen).
+  don't have one yet, finetune via `configs/finetune_config.yaml`.
 - LIBERO installed in a separate conda env. Set `LIBERO_PYTHON` and
   `LIBERO_HOME` (in `.env` is fine) so launchers can spawn env workers.
 - **Pi05 only**: local PaliGemma tokenizer dir at
