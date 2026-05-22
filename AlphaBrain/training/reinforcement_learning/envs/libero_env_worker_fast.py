@@ -21,6 +21,14 @@ import numpy as np
 from libero.libero import benchmark
 from libero.libero.envs import OffScreenRenderEnv
 
+# Die when the parent (train.py) dies, instead of orphaning to init and
+# holding GPU EGL contexts indefinitely. See common/parent_death.py.
+try:
+    from AlphaBrain.training.reinforcement_learning.common.parent_death import set_die_with_parent
+    set_die_with_parent()
+except Exception:
+    pass
+
 LIBERO_ENV_RESOLUTION = 256
 
 MAX_STEPS = {

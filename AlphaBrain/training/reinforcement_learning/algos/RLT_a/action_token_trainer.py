@@ -1,5 +1,5 @@
 """
-ActionToken Trainer: Two-phase training for the RLActionToken variant.
+ActionToken Trainer: Two-phase training for the RLT_a variant.
 
 Phase 1 — Encoder Pretraining:
   Freeze VLA, train encoder-decoder via reconstruction loss on rollout data.
@@ -27,8 +27,8 @@ from PIL import Image
 
 from AlphaBrain.training.reinforcement_learning.envs.libero_env import LiberoEnv
 from AlphaBrain.training.reinforcement_learning.common.replay_buffer import ReplayBuffer
-from AlphaBrain.training.reinforcement_learning.algos.RLActionToken.action_token_encoder_decoder import ActionTokenEncoderDecoder
-from AlphaBrain.training.reinforcement_learning.algos.RLActionToken.action_token_actor_critic import ActionTokenActor, ActionTokenCritic, ActionTokenQCritic
+from AlphaBrain.training.reinforcement_learning.algos.RLT_a.action_token_encoder_decoder import ActionTokenEncoderDecoder
+from AlphaBrain.training.reinforcement_learning.algos.RLT_a.action_token_actor_critic import ActionTokenActor, ActionTokenCritic, ActionTokenQCritic
 from AlphaBrain.training.reinforcement_learning.common.rollout import _unnormalize, _postprocess_action, _save_video
 
 logger = logging.getLogger(__name__)
@@ -70,6 +70,7 @@ class BatchInferenceServer:
         max_batch_size: int = 64,
         batch_timeout_s: float = 0.005,
         actor_chunk_len: int = None,
+        encoder_mode: str = "action_token",
     ):
         self.frozen_vla = frozen_vla
         self.encoder = encoder
@@ -80,6 +81,12 @@ class BatchInferenceServer:
         self.batch_timeout_s = batch_timeout_s
         # If actor uses shorter chunk than VLA, slice vla_actions accordingly
         self.actor_chunk_len = actor_chunk_len
+        # Encoder input mode:
+        #   "action_token": feed encoder the chunk_len action-query slice (default).
+        #   "rlt":      feed encoder the full last_hidden image-token slice
+        #                   (z_{1:M} from the RL Token reference, Eq. 1).
+        #   Both produce a rl_token of shape (B, 1, encoder.hidden_dim).
+        self.encoder_mode = encoder_mode
 
         self._q: queue.Queue = queue.Queue()
         self._stop = threading.Event()
@@ -140,15 +147,8 @@ class BatchInferenceServer:
             batch_props  = [r[2] for r in reqs]   # prop_state per request (or None)
 
             with torch.no_grad():
-                with torch.autocast("cuda", dtype=torch.bfloat16):
-                    action_queries, vla_actions = self.frozen_vla.get_vla_action(
-                        batch_images=batch_images,
-                        instructions=batch_instrs,
-                    )
-                rl_tokens = self.encoder.encode(action_queries)                   # (B, 1, D)
-
-                # Stack proprioceptive states for actor/critic
-                B = rl_tokens.size(0)
+                # Build props_t up-front so the Pi05 fused forward (which needs
+                # state for diffusion conditioning) can also use it.
                 if batch_props[0] is not None:
                     props_list = []
                     for p in batch_props:
@@ -159,6 +159,54 @@ class BatchInferenceServer:
                     props_t = torch.stack(props_list).to(self.device)             # (B, prop_dim)
                 else:
                     props_t = None
+
+                if self.encoder_mode == "rlt":
+                    # Pi05 (PaliGemmaPi05) takes a different inference path
+                    # entirely (no in-stream action tokens; action chunk comes
+                    # from the flow-matching head). Dispatch on framework type.
+                    from AlphaBrain.training.reinforcement_learning.algos.RLT.pi05_inference import (
+                        is_pi05, get_pi05_rl_state_and_action,
+                    )
+                    if is_pi05(self.frozen_vla):
+                        rl_tokens, vla_actions = get_pi05_rl_state_and_action(
+                            self.frozen_vla, self.encoder,
+                            batch_images=batch_images,
+                            instructions=batch_instrs,
+                            batch_props=props_t,
+                        )
+                        # Pi05 has no separate action_queries concept; keep a
+                        # placeholder so downstream code that may reference it
+                        # doesn't NameError.
+                        action_queries = None
+                    else:
+                        # Qwen rlt: one VLM forward gives full hidden +
+                        # action_queries + vla_actions; compact image-token
+                        # slice into z_{1:M} and feed RLT encoder.
+                        from AlphaBrain.training.reinforcement_learning.algos.RLT import (
+                            get_vla_hidden_states_and_action,
+                            compact_by_mask,
+                            pad_mask_from_attention,
+                        )
+                        last_hidden, encoder_mask, _action_mask, action_queries, vla_actions = \
+                            get_vla_hidden_states_and_action(
+                                self.frozen_vla,
+                                batch_images=batch_images,
+                                instructions=batch_instrs,
+                                image_only=True,
+                            )
+                        dense, kp_mask = compact_by_mask(last_hidden, encoder_mask)
+                        rl_tokens = self.encoder.encode(
+                            dense.float(), key_padding_mask=kp_mask
+                        )                                                              # (B, 1, H)
+                else:
+                    with torch.autocast("cuda", dtype=torch.bfloat16):
+                        action_queries, vla_actions = self.frozen_vla.get_vla_action(
+                            batch_images=batch_images,
+                            instructions=batch_instrs,
+                        )
+                    rl_tokens = self.encoder.encode(action_queries)                # (B, 1, D)
+
+                B = rl_tokens.size(0)
 
                 # Slice VLA actions to actor_chunk_len if specified
                 C_actor = self.actor_chunk_len
@@ -195,7 +243,7 @@ class BatchInferenceServer:
 
 @dataclass
 class ActionTokenStepRecord:
-    """One inference step during RLActionToken rollout."""
+    """One inference step during RLT_a rollout."""
     rl_token: torch.Tensor        # (1, D) detached cpu
     vla_action: torch.Tensor      # (chunk_len, action_dim) detached cpu
     action_taken: torch.Tensor    # (chunk_len, action_dim) detached cpu
@@ -403,7 +451,7 @@ def extract_action_queries_dataset(
 
 
 # ------------------------------------------------------------------
-# Phase 2: RLActionToken Rollout — frozen VLA + encoder + actor
+# Phase 2: RLT_a Rollout — frozen VLA + encoder + actor
 # ------------------------------------------------------------------
 
 def _action_token_rollout_one(
@@ -424,7 +472,7 @@ def _action_token_rollout_one(
     store_images: bool = False,
     reward_coef: float = 1.0,
 ) -> ActionTokenEpisode:
-    """Run one episode with RLActionToken actor via BatchInferenceServer.
+    """Run one episode with RLT_a actor via BatchInferenceServer.
 
     Chunk subsampling (paper): at stride-2 positions (2, 4, 6) within each chunk,
     call batch_server.infer() on the intermediate observation to get (rl_token, vla_action).
@@ -554,7 +602,7 @@ def action_token_collect_group(
     reward_coef: float = 1.0,
 ) -> List[ActionTokenEpisode]:
     """
-    Collect G episodes using RLActionToken policy.
+    Collect G episodes using RLT_a policy.
 
     Uses BatchInferenceServer for GPU inference: all num_envs env threads submit
     requests concurrently; a single background thread batches them into one GPU
@@ -629,7 +677,27 @@ def action_token_collect_group(
             success_count = 0
             for fut in as_completed(futures):
                 g_idx = futures[fut]
-                ep = fut.result()
+                try:
+                    ep = fut.result()
+                except Exception as _ep_err:
+                    # Async mode spawns ~G fresh LIBERO subprocesses per iter;
+                    # robosuite/MuJoCo EGL render-context init occasionally
+                    # native-SEGVs the worker under that spawn pressure (the
+                    # parent then sees "LIBERO worker exited unexpectedly").
+                    # Losing one episode is fine; poisoning the whole batch
+                    # via the rollout-thread's try/except (and the main loop
+                    # via the poison pill) is not. Mark this slot as an empty
+                    # failed episode — push_episodes_to_buffer skips
+                    # finish_step==0 so the buffer stays clean.
+                    print(f"  [rollout][dev={device}] ep g_idx={g_idx} FAILED "
+                          f"({type(_ep_err).__name__}: {_ep_err}); "
+                          f"dropping this episode.", flush=True)
+                    ep = ActionTokenEpisode(
+                        task_id=task_id, state_idx=int(state_ids[g_idx]))
+                    ep.success = False
+                    ep.reward = 0.0
+                    ep.finish_step = 0
+                    ep.env_steps = 0
                 episodes[g_idx] = ep
                 done_count += 1
                 if ep.success:
@@ -648,7 +716,7 @@ def action_token_collect_group(
 
 
 # ------------------------------------------------------------------
-# Phase 2: PPO-clip loss for RLActionToken small networks
+# Phase 2: PPO-clip loss for RLT_a small networks
 # ------------------------------------------------------------------
 
 def compute_action_token_gae(
@@ -657,7 +725,7 @@ def compute_action_token_gae(
     gae_lambda: float = 0.95,
 ):
     """
-    Compute GAE advantages and returns for a single RLActionToken episode.
+    Compute GAE advantages and returns for a single RLT_a episode.
 
     Returns:
         advantages: list of floats (len = finish_step)
@@ -702,7 +770,7 @@ def action_token_ppo_loss(
     device: str = "cuda",
 ):
     """
-    Compute PPO loss on a batch of RLActionToken episodes.
+    Compute PPO loss on a batch of RLT_a episodes.
 
     Only encoder + actor + critic have gradients.
     Optionally add reconstruction loss as regularizer.
@@ -1226,3 +1294,111 @@ def action_token_td_update(
             "target_mean": target.mean().item(),
         }
         return loss, stats
+
+
+# ------------------------------------------------------------------
+# GRPO (Group Relative Policy Optimization) loss
+#
+# DeepSeek-style: no value function, no GAE. Per-episode advantage is the
+# group-normalized return where a "group" = episodes sharing the same
+# initial state (state_idx). KL penalty to a reference policy regularizes
+# drift; K3 estimator keeps the gradient signal positive.
+#
+# Reuses the same on-policy collector and step records as PPO. Only the
+# loss differs.
+# ------------------------------------------------------------------
+
+def action_token_grpo_loss(
+    encoder: 'ActionTokenEncoderDecoder',
+    actor: 'ActionTokenActor',
+    ref_actor: 'ActionTokenActor',
+    episodes: List['ActionTokenEpisode'],
+    clip_eps: float = 0.2,
+    kl_coef: float = 0.04,
+    device: str = "cuda",
+):
+    """GRPO loss on a batch of episodes grouped by initial state.
+
+    For each group of episodes from the same state_idx:
+        advantage_i = (R_i - mean(R_group)) / (std(R_group) + eps)
+    A group with only one episode contributes zero advantage signal.
+
+    Loss = -E[min(ratio * A, clip(ratio, 1±ε) * A)]  +  kl_coef * KL(π || π_ref)
+    where ratio = exp(log π_new - log π_old), and KL uses the k3 estimator:
+        kl ≈ exp(ref_lp - new_lp) - (ref_lp - new_lp) - 1   (always ≥ 0)
+
+    Returns: (loss, stats_dict).
+    """
+    from collections import defaultdict
+
+    # ── 1. Group-relative episode-level advantages ────────────────────
+    groups = defaultdict(list)
+    for ep_idx, ep in enumerate(episodes):
+        groups[ep.state_idx].append((ep_idx, ep))
+
+    ep_advantages = [0.0] * len(episodes)
+    for state_idx, group in groups.items():
+        rewards = [ep.reward for _, ep in group]
+        if len(rewards) < 2:
+            # No within-group spread — no relative signal.
+            continue
+        mu = sum(rewards) / len(rewards)
+        var = sum((r - mu) ** 2 for r in rewards) / len(rewards)
+        sigma = max(var ** 0.5, 1e-8)
+        for (ep_idx, ep) in group:
+            ep_advantages[ep_idx] = (ep.reward - mu) / sigma
+
+    # ── 2. Flatten step records, broadcast episode advantage to all its steps ──
+    all_rl_tokens, all_vla_actions, all_actions_taken = [], [], []
+    all_old_log_probs, all_advantages, all_prop_states = [], [], []
+    for ep_idx, ep in enumerate(episodes):
+        adv = ep_advantages[ep_idx]
+        for t in range(ep.finish_step):
+            step = ep.step_records[t]
+            all_rl_tokens.append(step.rl_token)
+            all_vla_actions.append(step.vla_action)
+            all_actions_taken.append(step.action_taken)
+            all_old_log_probs.append(step.old_log_prob)
+            all_advantages.append(adv)
+            prop = step.prop_state if step.prop_state is not None else torch.zeros(8)
+            all_prop_states.append(prop)
+
+    if not all_rl_tokens:
+        return torch.tensor(0.0, device=device, requires_grad=True), {"n_steps": 0}
+
+    rl_tokens = torch.stack(all_rl_tokens).to(device)
+    vla_actions = torch.stack(all_vla_actions).to(device)
+    actions_taken = torch.stack(all_actions_taken).to(device)
+    old_lp = torch.tensor(all_old_log_probs, device=device)
+    advantages = torch.tensor(all_advantages, device=device, dtype=torch.float32)
+    prop_states = torch.stack(all_prop_states).to(device)
+
+    # ── 3. New policy log prob (with grad) and clipped surrogate ──────
+    new_lp = actor.log_prob_of(rl_tokens, vla_actions, actions_taken, prop_states)
+    ratio = torch.exp(new_lp - old_lp)
+    surr1 = ratio * advantages
+    surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * advantages
+    pg_loss = -torch.min(surr1, surr2).mean()
+
+    # ── 4. KL penalty (k3 estimator, no grad on reference) ────────────
+    with torch.no_grad():
+        ref_lp = ref_actor.log_prob_of(rl_tokens, vla_actions, actions_taken, prop_states)
+    log_ratio_ref = ref_lp - new_lp
+    kl = torch.exp(log_ratio_ref) - log_ratio_ref - 1.0
+    kl_loss = kl.mean()
+
+    loss = pg_loss + kl_coef * kl_loss
+
+    stats = {
+        "loss": loss.item(),
+        "pg_loss": pg_loss.item(),
+        "kl": kl_loss.item(),
+        "ratio_mean": ratio.mean().item(),
+        "clip_frac": ((ratio - 1.0).abs() > clip_eps).float().mean().item(),
+        "advantage_mean": advantages.mean().item(),
+        "advantage_std": advantages.std().item() if advantages.numel() > 1 else 0.0,
+        "n_groups": len(groups),
+        "n_groups_with_signal": sum(1 for s, g in groups.items() if len(g) >= 2),
+        "n_steps": len(all_rl_tokens),
+    }
+    return loss, stats

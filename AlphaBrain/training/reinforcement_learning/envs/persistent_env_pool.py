@@ -93,6 +93,12 @@ class _FastLiberoEnv:
         self.max_steps: int = 300
         self._closed = False
 
+        # After _restart_worker(), the new subprocess has no env loaded — any
+        # step()/step_chunk() before reset() would BrokenPipe. Track last
+        # reset args so subsequent step calls can auto-reset transparently.
+        self._needs_reset: bool = False
+        self._last_reset_args: Optional[dict] = None
+
         self._start_worker()
 
     def _start_worker(self):
@@ -126,6 +132,34 @@ class _FastLiberoEnv:
             except Exception:
                 pass
         self._start_worker()
+        # Fresh subprocess has no MuJoCo env loaded — caller must reset before
+        # the next step (handled transparently by step/step_chunk).
+        self._needs_reset = True
+
+    def _ensure_reset_after_restart(self):
+        """If the worker was just restarted, replay the last reset() args so
+        the new subprocess has the same task/state loaded."""
+        if not self._needs_reset:
+            return
+        if self._last_reset_args is None:
+            # Nothing to replay — caller must reset() first.
+            return
+        args = self._last_reset_args
+        print(f"  [INFO] Auto-resetting restarted worker (task={args.get('task_id')}, "
+              f"state={args.get('initial_state_idx')})", flush=True)
+        _write_msg_sock(self._sock, {
+            "cmd": "reset",
+            "task_suite": args["task_suite"],
+            "task_id": args["task_id"],
+            "initial_state_idx": args["initial_state_idx"],
+            "seed": args["seed"],
+        })
+        resp = _read_msg_sock(self._sock, timeout=120)
+        if resp.get("status") != "ok":
+            raise RuntimeError(f"Auto-reset failed: {resp.get('message', 'unknown')}")
+        self.task_description = resp["task_description"]
+        self.max_steps = resp["max_steps"]
+        self._needs_reset = False
 
     def reset(self, suite_name: str, task_id: int, initial_state_idx: int = 0, seed: int = 42) -> dict:
         _write_msg_sock(self._sock, {
@@ -148,13 +182,21 @@ class _FastLiberoEnv:
             raise RuntimeError(f"Worker error: {resp.get('message', 'unknown')}")
         self.task_description = resp["task_description"]
         self.max_steps = resp["max_steps"]
+        self._last_reset_args = {
+            "task_suite": suite_name,
+            "task_id": task_id,
+            "initial_state_idx": initial_state_idx,
+            "seed": seed,
+        }
+        self._needs_reset = False
         return _parse_obs(resp["obs"])
 
     def step(self, action_7d: np.ndarray) -> Tuple[dict, float, bool]:
         try:
+            self._ensure_reset_after_restart()
             _write_msg_sock(self._sock, {"cmd": "step", "action": action_7d.tolist()})
             resp = _read_msg_sock(self._sock, timeout=60)
-        except (TimeoutError, RuntimeError, ConnectionError, socket.timeout):
+        except (TimeoutError, RuntimeError, ConnectionError, socket.timeout, BrokenPipeError):
             self._restart_worker()
             raise RuntimeError("Worker timed out during step, restarted")
         if resp.get("status") != "ok":
@@ -164,9 +206,10 @@ class _FastLiberoEnv:
     def step_chunk(self, actions: list) -> Tuple[dict, float, bool, int]:
         """Execute multiple actions in one round-trip. Returns (obs, reward, done, steps_taken)."""
         try:
+            self._ensure_reset_after_restart()
             _write_msg_sock(self._sock, {"cmd": "step_chunk", "actions": [a.tolist() for a in actions]})
             resp = _read_msg_sock(self._sock, timeout=60)
-        except (TimeoutError, RuntimeError, ConnectionError, socket.timeout):
+        except (TimeoutError, RuntimeError, ConnectionError, socket.timeout, BrokenPipeError):
             self._restart_worker()
             raise RuntimeError("Worker timed out during step_chunk, restarted")
         if resp.get("status") != "ok":

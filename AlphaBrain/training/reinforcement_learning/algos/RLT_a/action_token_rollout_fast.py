@@ -22,12 +22,46 @@ import numpy as np
 import torch
 
 from AlphaBrain.training.reinforcement_learning.envs.persistent_env_pool import PersistentEnvPool
-from AlphaBrain.training.reinforcement_learning.algos.RLActionToken.action_token_encoder_decoder import ActionTokenEncoderDecoder
-from AlphaBrain.training.reinforcement_learning.algos.RLActionToken.action_token_actor_critic import ActionTokenActor, ActionTokenCritic
-from AlphaBrain.training.reinforcement_learning.algos.RLActionToken.action_token_trainer import ActionTokenEpisode, ActionTokenStepRecord
+from AlphaBrain.training.reinforcement_learning.algos.RLT_a.action_token_encoder_decoder import ActionTokenEncoderDecoder
+from AlphaBrain.training.reinforcement_learning.algos.RLT_a.action_token_actor_critic import ActionTokenActor, ActionTokenCritic
+from AlphaBrain.training.reinforcement_learning.algos.RLT_a.action_token_trainer import ActionTokenEpisode, ActionTokenStepRecord
 from AlphaBrain.training.reinforcement_learning.common.rollout import _unnormalize, _postprocess_action, DUMMY_ACTION
 
 logger = logging.getLogger(__name__)
+
+
+def _run_vla_and_encode(
+    frozen_vla,
+    encoder,
+    batch_images,
+    batch_instrs,
+    props_t,
+    encoder_mode: str,
+):
+    """One fused VLA forward + RL-token encoding for the rollout step.
+
+    Dispatches on ``encoder_mode`` and (for ``rlt``) on Qwen vs Pi05
+    backbone. Returns ``(rl_tokens, vla_actions, action_queries)`` —
+    ``action_queries`` is ``None`` for the Pi05 rlt path which has
+    no in-stream action tokens.
+    """
+    if encoder_mode == "rlt":
+        from AlphaBrain.training.reinforcement_learning.algos.RLT.pi05_inference import (
+            run_rlt_inference,
+        )
+        rl_tokens, vla_actions = run_rlt_inference(
+            frozen_vla, encoder, batch_images, batch_instrs, props_t,
+        )
+        # action_queries unused on the rlt path (Pi05 has none; Qwen
+        # path discards them inside run_rlt_inference).
+        return rl_tokens, vla_actions, None
+
+    # action_token mode: encoder takes the action-query slice directly.
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        action_queries, vla_actions = frozen_vla.get_vla_action(
+            batch_images=batch_images, instructions=batch_instrs)
+    rl_tokens = encoder.encode(action_queries)
+    return rl_tokens, vla_actions, action_queries
 
 
 def _env_step_chunk(env_pool, env_idx, action_chunk_unnorm, chunk_len, record_frames=False):
@@ -46,10 +80,22 @@ def _env_step_chunk(env_pool, env_idx, action_chunk_unnorm, chunk_len, record_fr
 
 
 def _env_dummy_steps(env_pool, env_idx, n_steps):
-    """Execute dummy actions (warmup). Returns final obs."""
+    """Execute dummy actions (warmup). Returns final obs.
+
+    On worker hang/crash, returns a zero-obs placeholder instead of raising —
+    matches `_env_step_chunk`'s recovery so a single env's failure doesn't
+    kill the entire rollout thread (the affected episode just becomes a
+    silent failure for this iter; auto-reset will recover the env next iter).
+    """
     obs = None
     for _ in range(n_steps):
-        obs, _, _ = env_pool.step_env(env_idx, DUMMY_ACTION)
+        try:
+            obs, _, _ = env_pool.step_env(env_idx, DUMMY_ACTION)
+        except RuntimeError as e:
+            print(f"  [WARNING] env {env_idx} dummy step failed: {e}", flush=True)
+            return {"primary_image": np.zeros((256, 256, 3), dtype=np.uint8),
+                    "wrist_image": np.zeros((256, 256, 3), dtype=np.uint8),
+                    "state": np.zeros(8, dtype=np.float32)}
     return obs
 
 
@@ -78,6 +124,7 @@ def action_token_collect_group_steplock(
     actor_chunk_len: int = None,
     env_offset: int = 0,
     warmup_mode: bool = False,
+    encoder_mode: str = "action_token",
 ) -> List[ActionTokenEpisode]:
     """
     Collect G episodes using step-lock architecture.
@@ -158,19 +205,19 @@ def action_token_collect_group_steplock(
         batch_props = [np.array(obs_list[g]["state"], dtype=np.float32) for g in active_ids]
 
         print(f"  [VLA forward] batch={len(batch_images)}, active_envs={len(active_ids)}", flush=True)
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            action_queries, vla_actions = frozen_vla.get_vla_action(
-                batch_images=batch_images, instructions=batch_instrs)
+        # Build props_t up-front so Pi05's fused forward can also use it for
+        # diffusion conditioning (it needs `state`).
+        props_t = torch.tensor(np.array(batch_props), dtype=torch.float32).to(device)
+        rl_tokens, vla_actions, action_queries = _run_vla_and_encode(
+            frozen_vla, encoder, batch_images, batch_instrs, props_t, encoder_mode,
+        )
         torch.cuda.synchronize()
         _t1 = time.time()
         _t_vla_forward += _t1 - _t0
-        print(f"  [VLA done] aq={action_queries.shape} va={vla_actions.shape} time={_t1-_t0:.3f}s", flush=True)
+        print(f"  [VLA done] va={vla_actions.shape} time={_t1-_t0:.3f}s", flush=True)
 
-        # ── Step 2: Batch encoder + actor ──
+        # ── Step 2: Batch actor ──
         _t0 = time.time()
-        rl_tokens = encoder.encode(action_queries)  # (N_active, 1, D)
-
-        props_t = torch.tensor(np.array(batch_props), dtype=torch.float32).to(device)
 
         # Slice VLA actions for actor if actor uses shorter chunk
         if actor_chunk_len < vla_actions.size(1):
@@ -311,6 +358,7 @@ def action_token_collect_multitask_steplock(
     reward_coef: float = 1.0,
     actor_chunk_len: int = None,
     warmup_mode: bool = False,
+    encoder_mode: str = "action_token",
 ) -> List[ActionTokenEpisode]:
     """
     Collect episodes for MULTIPLE tasks on ONE GPU in a single step-lock loop.
@@ -388,12 +436,12 @@ def action_token_collect_multitask_steplock(
         batch_instrs = [task_descriptions[g] for g in active_ids]
         batch_props = [np.array(obs_list[g]["state"], dtype=np.float32) for g in active_ids]
 
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            action_queries, vla_actions = frozen_vla.get_vla_action(
-                batch_images=batch_images, instructions=batch_instrs)
-
-        rl_tokens = encoder.encode(action_queries)
+        # Build props_t up-front so Pi05's fused forward can use it for
+        # diffusion conditioning (state).
         props_t = torch.tensor(np.array(batch_props), dtype=torch.float32).to(device)
+        rl_tokens, vla_actions, action_queries = _run_vla_and_encode(
+            frozen_vla, encoder, batch_images, batch_instrs, props_t, encoder_mode,
+        )
 
         if actor_chunk_len < vla_actions.size(1):
             vla_actions_for_actor = vla_actions[:, :actor_chunk_len, :]

@@ -25,16 +25,19 @@ from accelerate.utils import set_seed
 from AlphaBrain.model.framework.base_framework import BaseFramework
 from AlphaBrain.training.reinforcement_learning.common.ckpt_io import save_rlt_checkpoint
 from AlphaBrain.training.reinforcement_learning.eval.eval_helpers import _eval_deterministic_local
+from AlphaBrain.training.reinforcement_learning.eval.eval_helpers_rlt import (
+    _eval_deterministic_local_rlt,
+)
 from AlphaBrain.training.reinforcement_learning.envs.libero_env import MAX_STEPS, get_suite_info
 from AlphaBrain.training.reinforcement_learning.common.replay_buffer import ReplayBuffer
-from AlphaBrain.training.reinforcement_learning.algos.RLActionToken.action_token_actor_critic import (
+from AlphaBrain.training.reinforcement_learning.algos.RLT_a.action_token_actor_critic import (
     ActionTokenActor,
     ActionTokenCritic,
     ActionTokenQCritic,
     soft_update_target,
 )
-from AlphaBrain.training.reinforcement_learning.algos.RLActionToken.action_token_encoder_decoder import ActionTokenEncoderDecoder
-from AlphaBrain.training.reinforcement_learning.algos.RLActionToken.action_token_trainer import push_episodes_to_buffer
+from AlphaBrain.training.reinforcement_learning.algos.RLT_a.action_token_encoder_decoder import ActionTokenEncoderDecoder
+from AlphaBrain.training.reinforcement_learning.algos.RLT_a.action_token_trainer import push_episodes_to_buffer
 
 logger = logging.getLogger(__name__)
 
@@ -64,11 +67,16 @@ def run_rl_offpolicy(args):
 
     # ── Load frozen VLA on each rollout GPU ──────────────
     vla_copies = {}
+    # bf16 for both Qwen and Pi05: halves weight memory (~12→6 GB per copy)
+    # and matches the standalone eval setting (use_bf16=true), which scores
+    # 91%+ SR on the same Pi05 ckpts.
+    _vla_dtype = torch.bfloat16
+
     for i, gpu_id in enumerate(rollout_gpu_ids):
         device = f"cuda:{gpu_id}"
         logger.info(f"  Loading frozen VLA on GPU {gpu_id} ({i+1}/{n_rollout_gpus})...")
         vla = BaseFramework.from_pretrained(args.ckpt_path)
-        vla = vla.to(torch.bfloat16).to(device).eval()
+        vla = vla.to(_vla_dtype).to(device).eval()
         for p in vla.parameters():
             p.requires_grad_(False)
         vla_copies[gpu_id] = vla
@@ -79,7 +87,7 @@ def run_rl_offpolicy(args):
         # (the rollout loop may have already loaded a frozen copy — replace it)
         logger.info(f"  Loading TRAINABLE VLA on train GPU {train_gpu_id} (full fine-tune)...")
         vla = BaseFramework.from_pretrained(args.ckpt_path)
-        vla = vla.to(torch.bfloat16).to(train_device).train()
+        vla = vla.to(_vla_dtype).to(train_device).train()
         if hasattr(vla, "qwen_vl_interface") and hasattr(vla.qwen_vl_interface, "model"):
             vla.qwen_vl_interface.model.gradient_checkpointing_enable()
         vla_copies[train_gpu_id] = vla
@@ -87,19 +95,20 @@ def run_rl_offpolicy(args):
     elif train_gpu_id not in vla_copies:
         logger.info(f"  Loading frozen VLA on train GPU {train_gpu_id}...")
         vla = BaseFramework.from_pretrained(args.ckpt_path)
-        vla = vla.to(torch.bfloat16).to(train_device).eval()
+        vla = vla.to(_vla_dtype).to(train_device).eval()
         for p in vla.parameters():
             p.requires_grad_(False)
         vla_copies[train_gpu_id] = vla
 
-    # Get model config from any VLA copy
+    # Backbone-agnostic metadata (Qwen vs Pi05): hidden_dim, action_norm_stats,
+    # chunk_len, action_dim. See pi05_inference.resolve_vla_metadata.
+    from AlphaBrain.training.reinforcement_learning.algos.RLT.pi05_inference import (
+        is_pi05, resolve_vla_metadata,
+    )
     ref_vla = vla_copies[rollout_gpu_ids[0]]
-    hidden_dim = ref_vla.qwen_vl_interface.model.config.hidden_size
-    chunk_len = ref_vla.chunk_len
-    action_dim = ref_vla.config.framework.action_model.action_dim
-    _norm_stats = ref_vla.norm_stats
-    _unnorm_key = next(iter(_norm_stats.keys()))
-    action_norm_stats = _norm_stats[_unnorm_key]["action"]
+    hidden_dim, action_norm_stats, chunk_len, action_dim = resolve_vla_metadata(ref_vla)
+    if is_pi05(ref_vla):
+        logger.info("Pi05 detected: using identity action_norm_stats (Pi05 returns env-space actions)")
 
     # Actor chunk length: paper uses C < H (e.g. VLA H=50, actor C=10)
     # For LIBERO: VLA chunk=8, actor chunk=4 (re-plan every 4 steps)
@@ -123,14 +132,40 @@ def run_rl_offpolicy(args):
         args._selected_task_ids = None
 
     # ── Create trainable modules on train_gpu ────────────
-    enc_dec = ActionTokenEncoderDecoder(
-        input_dim=hidden_dim,
-        bottleneck_dim=args.bottleneck_dim,
-        chunk_len=chunk_len,
-        num_heads=args.encoder_heads,
-        encoder_layers=args.encoder_layers,
-        decoder_layers=args.encoder_layers,
-    ).to(train_device)
+    encoder_mode = getattr(args, "encoder_mode", "action_token")
+    if encoder_mode == "rlt":
+        # RL Token reference track: z_rl kept at VLA hidden dim (no extra
+        # bottleneck projection). --bottleneck_dim here is repurposed as
+        # the encoder's hidden_dim and should equal the VLA's hidden_size
+        # (2048 for Qwen2.5-VL-3B).
+        from AlphaBrain.training.reinforcement_learning.algos.RLT import (
+            RLTokenEncoderDecoder,
+        )
+        if args.bottleneck_dim != hidden_dim:
+            logger.warning(
+                f"  --bottleneck_dim={args.bottleneck_dim} != VLA hidden_dim={hidden_dim}; "
+                f"RLT encoder uses VLA hidden dim. Overriding bottleneck_dim."
+            )
+            args.bottleneck_dim = hidden_dim
+        enc_dec = RLTokenEncoderDecoder(
+            hidden_dim=hidden_dim,
+            num_heads=args.encoder_heads,
+            encoder_layers=args.encoder_layers,
+            decoder_layers=getattr(args, "decoder_layers", args.encoder_layers),
+            max_len=getattr(args, "max_len", 4096),
+        ).to(train_device)
+        # rlt + steplock: now supported via the encoder_mode kwarg on
+        # action_token_collect_*_steplock (we pass it through below). The
+        # rollout-fast loop dispatches to the rlt encoder path internally.
+    else:
+        enc_dec = ActionTokenEncoderDecoder(
+            input_dim=hidden_dim,
+            bottleneck_dim=args.bottleneck_dim,
+            chunk_len=chunk_len,
+            num_heads=args.encoder_heads,
+            encoder_layers=args.encoder_layers,
+            decoder_layers=args.encoder_layers,
+        ).to(train_device)
 
     if args.encoder_path:
         logger.info(f"  Loading pretrained encoder from {args.encoder_path}")
@@ -210,7 +245,7 @@ def run_rl_offpolicy(args):
     if args.use_steplock:
         # Step-lock mode: persistent env pools (no BatchInferenceServer needed)
         from AlphaBrain.training.reinforcement_learning.envs.persistent_env_pool import PersistentEnvPool
-        from AlphaBrain.training.reinforcement_learning.algos.RLActionToken.action_token_rollout_fast import (
+        from AlphaBrain.training.reinforcement_learning.algos.RLT_a.action_token_rollout_fast import (
             action_token_collect_group_steplock,
             action_token_collect_multitask_steplock,
         )
@@ -247,7 +282,7 @@ def run_rl_offpolicy(args):
         # No pre-warm needed — parallel reset in rollout handles MuJoCo init.
     else:
         # Async mode: BatchInferenceServer per GPU
-        from AlphaBrain.training.reinforcement_learning.algos.RLActionToken.action_token_trainer import BatchInferenceServer
+        from AlphaBrain.training.reinforcement_learning.algos.RLT_a.action_token_trainer import BatchInferenceServer
         rollout_servers = {}
         rollout_env_pools = {}  # not used in async mode
         for gpu_id in rollout_gpu_ids:
@@ -260,6 +295,7 @@ def run_rl_offpolicy(args):
                 device=f"cuda:{gpu_id}",
                 max_batch_size=args.num_envs * 4,
                 actor_chunk_len=actor_chunk_len if actor_chunk_len != chunk_len else None,
+                encoder_mode=encoder_mode,
             ).start()
             rollout_servers[gpu_id] = server
         logger.info(f"  Started BatchInferenceServer on GPU {gpu_id} "
@@ -324,7 +360,10 @@ def run_rl_offpolicy(args):
     # asynchronous rollout + learning design.
 
     buffer_lock = threading.Lock()
-    rollout_stats_queue = queue.Queue()   # (episodes, iteration)
+    # Bounded queue: rollout blocks on `put()` when main falls behind instead
+    # of racing ahead indefinitely. Decouples rollout lifetime from
+    # args.max_iter (see _rollout_thread_fn below).
+    rollout_stats_queue = queue.Queue(maxsize=8)   # (episodes, iteration)
     _stop_rollout = threading.Event()
     _weight_sync_lock = threading.Lock()  # protects weight copy (non-blocking)
 
@@ -372,6 +411,13 @@ def run_rl_offpolicy(args):
         """
         per_task_eval_sr_local = {}
         eval_result_local = None
+        # Route eval through the encoder-mode-matching helper. The default
+        # helper's encoder.encode(action_queries) path is wrong for rlt
+        # encoders (trained on compacted image hidden states) and silently
+        # gives low SR even when rollout SR is high.
+        _eval_fn = (_eval_deterministic_local_rlt
+                    if encoder_mode == "rlt"
+                    else _eval_deterministic_local)
 
         if args.all_tasks:
             # Multi-task eval
@@ -405,7 +451,7 @@ def run_rl_offpolicy(args):
                         e_enc, e_actor = eval_modules[gpu_id]
                         task_vid_dir = (os.path.join(eval_video_dir, f"task_{tid}") if eval_video_dir else None)
                         fut = pool.submit(
-                            _eval_deterministic_local,
+                            _eval_fn,
                             frozen_vla=vla_copies[gpu_id],
                             encoder=e_enc,
                             actor=e_actor,
@@ -465,7 +511,7 @@ def run_rl_offpolicy(args):
                         continue
                     e_enc, e_actor = eval_modules[gpu_id]
                     fut = pool.submit(
-                        _eval_deterministic_local,
+                        _eval_fn,
                         frozen_vla=vla_copies[gpu_id],
                         encoder=e_enc,
                         actor=e_actor,
@@ -517,14 +563,28 @@ def run_rl_offpolicy(args):
         finally:
             _eval_thread_holder[0] = None
 
-    def _rollout_thread_fn(start_iter, max_iter_val):
-        """Background thread: continuously collects episodes and pushes to buffer."""
+    def _rollout_thread_fn(start_iter):
+        """Background thread: continuously collects episodes and pushes to buffer.
+
+        Runs until `_stop_rollout` is set — which happens only after the main
+        loop has consumed its `args.max_iter` training tuples. Previously this
+        was a `for it in range(..., max_iter + 1)` loop, which made rollout
+        exit at iter==max_iter even when the slower main loop (async mode,
+        large td_updates_per_iter × utd_ratio) hadn't yet drained the queue.
+        If rollout then hit any late-iteration exception — e.g. a transient
+        cuda error while contending with TD updates on a shared GPU — the
+        poison-pill path broke the main loop early. Decoupling rollout's
+        lifetime from max_iter removes that coupling: rollout keeps producing
+        (subject to the bounded queue's backpressure) as long as training
+        still wants data.
+        """
+        it = start_iter
         try:
-          for it in range(start_iter, max_iter_val + 1):
-            if _stop_rollout.is_set():
-                break
+          while not _stop_rollout.is_set():
             # Wait if paused (during eval)
             _rollout_go.wait()  # blocks until set
+            if _stop_rollout.is_set():
+                break
 
             # Build task list
             if args.all_tasks:
@@ -573,6 +633,7 @@ def run_rl_offpolicy(args):
                                 group_size=args.group_size, reward_coef=args.reward_coef,
                                 actor_chunk_len=actor_chunk_len if actor_chunk_len != chunk_len else None,
                                 warmup_mode=_steplock_warmup[0],
+                                encoder_mode=encoder_mode,
                             )
                         else:
                             eps = action_token_collect_group_steplock(
@@ -589,6 +650,7 @@ def run_rl_offpolicy(args):
                                 group_size=args.group_size, reward_coef=args.reward_coef,
                                 actor_chunk_len=actor_chunk_len if actor_chunk_len != chunk_len else None,
                                 warmup_mode=_steplock_warmup[0],
+                                encoder_mode=encoder_mode,
                             )
                         gpu_results[gpu_id] = (task_list, eps)
 
@@ -609,7 +671,7 @@ def run_rl_offpolicy(args):
                                     f"{len(eps)} eps, {n_s} success")
             else:
                 # Async mode: use ThreadPoolExecutor
-                from AlphaBrain.training.reinforcement_learning.algos.RLActionToken.action_token_trainer import action_token_collect_group
+                from AlphaBrain.training.reinforcement_learning.algos.RLT_a.action_token_trainer import action_token_collect_group
                 all_eps = []
                 per_task_sr = {}
                 futs = {}
@@ -653,7 +715,16 @@ def run_rl_offpolicy(args):
                 n_pushed = push_episodes_to_buffer(
                     all_eps, replay_buffer, gamma_per_step=args.gamma)
 
-            rollout_stats_queue.put((all_eps, it, n_pushed))
+            # Backpressure: block on put but poll _stop_rollout so shutdown
+            # doesn't deadlock here when the main loop has already exited and
+            # stopped consuming.
+            while not _stop_rollout.is_set():
+                try:
+                    rollout_stats_queue.put((all_eps, it, n_pushed), timeout=1.0)
+                    break
+                except queue.Full:
+                    continue
+            it += 1
         except Exception as e:
             import traceback
             logger.error(f"!!! Rollout thread CRASHED at iter {it}: {e}")
@@ -670,15 +741,16 @@ def run_rl_offpolicy(args):
     # ── Training loop (async rollout + TD updates) ────
     # Launch rollout in background
     rollout_thread = threading.Thread(
-        target=_rollout_thread_fn, args=(1, args.max_iter), daemon=True)
+        target=_rollout_thread_fn, args=(1,), daemon=True)
     rollout_thread.start()
     logger.info("Started async rollout thread")
 
     td_global_step = 0
     last_sync_step = 0
+    last_completed_iter = 0  # last training iter whose body fully ran; drives final-ckpt name
     sync_every_n_updates = 500  # sync weights to rollout every N TD3 updates
 
-    from AlphaBrain.training.reinforcement_learning.algos.RLActionToken.action_token_trainer import (
+    from AlphaBrain.training.reinforcement_learning.algos.RLT_a.action_token_trainer import (
         action_token_td_actor_update,
         action_token_td_critic_update,
     )
@@ -818,7 +890,7 @@ def run_rl_offpolicy(args):
             # ── VLA fine-tune step ──
             if (args.finetune_vla and optimizer_vla is not None
                     and iteration % args.vla_update_freq == 0):
-                from AlphaBrain.training.reinforcement_learning.algos.RLActionToken.action_token_trainer import vla_finetune_step
+                from AlphaBrain.training.reinforcement_learning.algos.RLT_a.action_token_trainer import vla_finetune_step
                 train_vla = vla_copies[train_gpu_id]
                 train_vla.train()
                 optimizer_vla.zero_grad()
@@ -987,6 +1059,8 @@ def run_rl_offpolicy(args):
             save_rlt_checkpoint(enc_dec, actor, q_critic,
                                 iteration, args.output_dir, phase="rl_offpolicy")
 
+        last_completed_iter = iteration
+
     # Stop rollout thread
     _stop_rollout.set()
     rollout_thread.join(timeout=10)
@@ -1019,9 +1093,12 @@ def run_rl_offpolicy(args):
             server.stop()
             logger.info(f"  Stopped BatchInferenceServer on GPU {gpu_id}")
 
-    # Final save
+    # Final save — use the last actually-completed iter, not args.max_iter.
+    # Matters when the loop bailed early (e.g. rollout poison pill): the ckpt
+    # then accurately reflects the weights' true training iter instead of
+    # silently naming itself iter_<max_iter>.
     save_rlt_checkpoint(enc_dec, actor, q_critic,
-                        args.max_iter, args.output_dir, phase="rl_offpolicy")
+                        last_completed_iter, args.output_dir, phase="rl_offpolicy")
     metrics_path = Path(args.output_dir) / "metrics.json"
     metrics_path.parent.mkdir(parents=True, exist_ok=True)
     with open(metrics_path, "w") as f:

@@ -217,9 +217,12 @@ def get_suite_info(suite_name: str, libero_python: Optional[str] = None) -> dict
     if libero_home:
         existing = run_env.get("PYTHONPATH", "")
         run_env["PYTHONPATH"] = f"{libero_home}:{existing}" if existing else libero_home
+    # 30s used to be enough on a single eval, but with N>10 parallel eval
+    # processes all importing libero from shared NFS the import phase alone
+    # can exceed that. 180s is generous; failures past that are real hangs.
     result = subprocess.run(
         [python_bin, "-c", script],
-        capture_output=True, text=True, timeout=30,
+        capture_output=True, text=True, timeout=180,
         env=run_env,
     )
     if result.returncode != 0:
